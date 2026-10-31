@@ -1,0 +1,4 @@
+module CAtomicMixer {
+    header "CAtomicMixer.h"
+    export *
+}

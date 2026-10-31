@@ -1,0 +1,56 @@
+name: Publish approved public site
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Approved published release tag
+        required: true
+        type: string
+      expected_commit:
+        description: Exact approved public commit SHA (40 characters)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  pages:
+    if: github.repository == 'tm-henningnt/babelfin' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_commit || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Scan and build approved site
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 scripts/build_site.py --output _site
+      - name: Verify source, site, published assets and exact release commit
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          RELEASE_COMMIT: ${{ inputs.expected_commit || github.sha }}
+        run: python3 scripts/release_gate.py --source . --site _site --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --verify-remote
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy public site
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,19 @@
+.build/
+.swiftpm/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+*.pem
+*.pcm
+*.wav
+dist/
+installers/*.pkg
+__pycache__/
+*.py[cod]
+
+# Claude Code agent worktrees
+/.claude/worktrees/
