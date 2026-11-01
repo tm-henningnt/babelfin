@@ -28,13 +28,23 @@ public struct TranslationConfiguration: Equatable, Sendable {
     public let pacing: TranslationPacing
     /// False for text-only translation: composed routes skip speech synthesis.
     public let speaksTranslation: Bool
+    /// Voices for Speaker 1, 2, … on a route whose recognizer labels speakers. Empty turns labels off.
+    public let speakerVoices: [String]
+    public static let maximumSpeakerVoices = 8
     public init(targetLanguage: String = "en", noiseReduction: TranslationNoiseReduction = .nearField,
                 route: TranslationRoute = .openAI, sourceLanguage: String? = nil, voiceID: String? = nil,
-                pacing: TranslationPacing = .balanced, speaksTranslation: Bool = true) {
+                pacing: TranslationPacing = .balanced, speaksTranslation: Bool = true, speakerVoices: [String] = []) {
         self.targetLanguage = targetLanguage
         self.noiseReduction = noiseReduction
         self.route = route; self.sourceLanguage = sourceLanguage; self.voiceID = voiceID; self.pacing = pacing
         self.speaksTranslation = speaksTranslation
+        self.speakerVoices = Array(speakerVoices.prefix(Self.maximumSpeakerVoices))
+    }
+    /// The voice for a speaker label ("1", "2", …): the speaker voices in order, repeating when
+    /// there are more speakers than voices. A segment without a label uses `voiceID`.
+    public func voice(forSpeaker speaker: String?) -> String? {
+        guard let speaker, let number = Int(speaker), number > 0, !speakerVoices.isEmpty else { return voiceID }
+        return speakerVoices[(number - 1) % speakerVoices.count]
     }
 }
 
@@ -69,6 +79,13 @@ public struct PassageTiming: Equatable, Sendable {
     /// Time spent waiting for the previous passage to finish playing.
     public var waitSeconds: Double {
         preparedAhead ? totalSeconds : max(0, totalSeconds - (translateSeconds ?? 0) - (voiceSeconds ?? 0))
+    }
+    public enum Stage: String, CaseIterable, Sendable { case translation, voice, waiting }
+    /// The parts of `totalSeconds`, in order. A passage prepared ahead only waited: its
+    /// translation and speech ran while the previous passage played.
+    public var stages: [(stage: Stage, seconds: Double)] {
+        if preparedAhead { return [(.waiting, totalSeconds)] }
+        return [(.translation, translateSeconds ?? 0), (.voice, voiceSeconds ?? 0), (.waiting, waitSeconds)].filter { $0.seconds > 0 }
     }
 }
 

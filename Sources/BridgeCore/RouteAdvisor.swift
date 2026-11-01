@@ -53,6 +53,8 @@ public enum RouteAdvisor {
         }
         return candidates.sorted { a, b in
             if a.ready != b.ready { return a.ready }
+            // On this Mac needs no account but translates less well: a ready cloud route comes first.
+            if a.route.services.isEmpty != b.route.services.isEmpty { return !a.route.services.isEmpty }
             if (a.sourceLanguage != nil) != (b.sourceLanguage != nil) { return a.sourceLanguage != nil }
             if a.route.services.count != b.route.services.count { return a.route.services.count < b.route.services.count }
             if a.route.isDirect != b.route.isDirect { return a.route.isDirect }

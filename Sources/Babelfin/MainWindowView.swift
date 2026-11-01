@@ -2,38 +2,29 @@ import AppKit
 import SwiftUI
 import BridgeCore
 
-/// Sidebar destinations of the main window. Each direction keeps its own audio model.
+/// Sidebar destinations of the main window.
 enum MainSection: String, CaseIterable, Hashable {
-    case outgoing, incoming, transcript, recording, notes, voice
+    case home, transcript, tools
     var title: String {
         switch self {
-        case .outgoing: return "Speak"
-        case .incoming: return "Listen"
+        case .home: return "Home"
         case .transcript: return "Transcript"
-        case .recording: return "Audio file"
-        case .notes: return "Meeting notes"
-        case .voice: return "Voice clip"
+        case .tools: return "Tools"
         }
     }
     var symbol: String {
         switch self {
-        case .outgoing: return "mic"
-        case .incoming: return "headphones"
+        case .home: return "house"
         case .transcript: return "text.bubble"
-        case .recording: return "waveform"
-        case .notes: return "note.text"
-        case .voice: return "speaker.wave.2"
+        case .tools: return "wrench.and.screwdriver"
         }
-    }
-    var toolPage: SpeechToolsPage? {
-        switch self { case .recording: return .recording; case .notes: return .notes; case .voice: return .voice; default: return nil }
     }
 }
 
 /// Menus, compact controls and the status item open a section through this one owner.
 @MainActor final class MainNavigation: ObservableObject {
     static let shared = MainNavigation()
-    @Published var section: MainSection = .outgoing
+    @Published var section: MainSection = .home
 }
 
 /// Account voice names are cached for display only; the voice ID stays the identity.
@@ -74,6 +65,7 @@ extension AppModel {
     }
     var voiceDisplayName: String {
         if route.descriptor.isDirect { return "Follows the speaker" }
+        if route.descriptor.speechService == nil { return "System voice" }
         if voiceID.isEmpty { return capabilities.requiresVoiceID ? "Choose a voice" : "Default voice" }
         return VoiceNameCache.name(for: voiceID) ?? "Saved voice"
     }
@@ -82,6 +74,7 @@ extension AppModel {
 struct MainWindowView: View {
     @ObservedObject var conversation: ConversationModel
     @ObservedObject private var navigation = MainNavigation.shared
+    @ObservedObject private var subtitles = SubtitleOverlay.shared
     #if BABELFIN_SCREENSHOTS
     @StateObject private var tools = ScreenshotDemo.tools()
     #else
@@ -89,112 +82,57 @@ struct MainWindowView: View {
     #endif
     var showCompact: () -> Void
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                sidebar
-                Divider()
-                detail.frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+        HStack(spacing: 0) {
+            sidebar
             Divider()
-            statusBar
+            detail.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .onAppear { sync(navigation.section) }
-        .onChange(of: navigation.section) { sync($0) }
-        .onChange(of: conversation.direction) { direction in
-            if navigation.section == .outgoing || navigation.section == .incoming {
-                navigation.section = direction == .outgoing ? .outgoing : .incoming
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button { subtitles.toggle() } label: { Label(subtitles.visible ? "Hide Subtitles" : "Show Subtitles", systemImage: "captions.bubble") }
+                    .help(subtitles.visible ? "Hide the subtitles" : "Show the subtitles over other windows")
+                Button(action: showCompact) { Label("Compact", systemImage: "rectangle.compress.vertical") }
+                    .help("Show compact controls")
             }
         }
     }
     private var sidebar: some View {
         VStack(spacing: 0) {
             List(selection: Binding(get: { navigation.section }, set: { if let value = $0 { navigation.section = value } })) {
-                Section("Translation") {
-                    directionRow(.outgoing, model: conversation.outgoing)
-                    directionRow(.incoming, model: conversation.incoming)
-                }
-                Section("Conversation") {
+                ForEach(MainSection.allCases, id: \.self) { section in
                     HStack {
-                        Label(MainSection.transcript.title, systemImage: MainSection.transcript.symbol)
+                        Label(section.title, systemImage: section.symbol)
                         Spacer()
-                        if !conversation.transcript.entries.isEmpty {
+                        if section == .home && conversation.active {
+                            Circle().fill(.green).frame(width: 7, height: 7).accessibilityLabel("Translating")
+                        }
+                        if section == .transcript && !conversation.transcript.entries.isEmpty {
                             Text("\(conversation.transcript.entries.count)").font(.caption).foregroundStyle(.secondary).monospacedDigit()
                         }
-                    }.tag(MainSection.transcript)
-                }
-                Section("Tools") {
-                    ForEach([MainSection.recording, .notes, .voice], id: \.self) { section in
-                        Label(section.title, systemImage: section.symbol).tag(section)
-                    }
+                    }.tag(section)
                 }
             }
             .listStyle(.sidebar)
             .accessibilityLabel("Sections")
             Divider()
-            HStack(spacing: 8) {
-                Button { AppLinks.openHelp() } label: {
-                    Label("How to use", systemImage: "questionmark.circle").frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.plain)
-                OpenSettingsButton().labelStyle(.iconOnly).buttonStyle(.plain)
-                    .help("Settings").accessibilityLabel("Settings")
+            VStack(alignment: .leading, spacing: 8) {
+                Button { AppLinks.openHelp() } label: { Label("Help", systemImage: "questionmark.circle") }
+                OpenSettingsButton(title: "Settings")
             }
-            .foregroundStyle(.secondary)
+            .buttonStyle(.plain).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 16).padding(.vertical, 10)
         }
-        .frame(width: 210)
-    }
-    private func directionRow(_ section: MainSection, model: AppModel) -> some View {
-        DirectionSidebarRow(section: section, model: model).tag(section)
+        .frame(width: 190)
     }
     @ViewBuilder private var detail: some View {
         switch navigation.section {
-        case .outgoing:
-            MainView(model: conversation.outgoing, incoming: false, showCompact: showCompact).id(MainSection.outgoing)
-        case .incoming:
-            MainView(model: conversation.incoming, incoming: true, showCompact: showCompact).id(MainSection.incoming)
+        case .home:
+            HomeView(conversation: conversation) { navigation.section = .transcript }
         case .transcript:
             MeetingTranscriptView(conversation: conversation)
-        case .recording, .notes, .voice:
+        case .tools:
             SpeechToolsView(model: tools, meetingText: { conversation.transcript.plainText(selection: .source) }, showsSidebar: false)
         }
-    }
-    private var statusBar: some View {
-        HStack(spacing: 10) {
-            Text("Speak: \(conversation.outgoing.shortStatus)")
-            Text("·").accessibilityHidden(true)
-            Text("Listen: \(conversation.incoming.shortStatus)")
-            Spacer()
-            if conversation.active {
-                Button("Turn both off") { Task {
-                    async let outgoing: Void = TranslationControlActions(model: conversation.outgoing).turnOff()
-                    async let incoming: Void = TranslationControlActions(model: conversation.incoming).turnOff()
-                    _ = await (outgoing, incoming)
-                } }.controlSize(.small)
-            } else {
-                Text(conversation.transcript.entries.isEmpty ? "Transcript empty" : "Transcript: \(conversation.transcript.entries.count) lines in memory")
-            }
-        }
-        .font(.caption).foregroundStyle(.secondary)
-        .padding(.horizontal, 14).frame(height: 28)
-        .background(Color(nsColor: .windowBackgroundColor))
-    }
-    private func sync(_ section: MainSection) {
-        if section == .outgoing { conversation.direction = .outgoing }
-        if section == .incoming { conversation.direction = .incoming }
-        if let page = section.toolPage, tools.page != page { tools.page = page }
-    }
-}
-
-private struct DirectionSidebarRow: View {
-    let section: MainSection
-    @ObservedObject var model: AppModel
-    var body: some View {
-        HStack {
-            Label(section.title, systemImage: section.symbol)
-            Spacer()
-            Text(model.shortStatus).font(.caption).foregroundStyle(model.statusColor == .secondary ? Color.secondary : model.statusColor)
-        }
-        .accessibilityElement(children: .combine)
     }
 }

@@ -1,3 +1,4 @@
+import Charts
 import SwiftUI
 import BridgeCore
 
@@ -11,6 +12,8 @@ enum PipelineTimingPreferences {
 struct PipelineTimingView: View {
     @ObservedObject var model: AppModel
     var compact = false
+    /// Compact controls show the line without the stage bar.
+    var showsBar = true
     private var timings: [PassageTiming] { model.passageTimings }
 
     var body: some View {
@@ -25,19 +28,73 @@ struct PipelineTimingView: View {
         }
     }
 
+    /// The stage names of this route, for the legend and the table.
+    private func name(_ stage: PassageTiming.Stage) -> String {
+        let stages = model.route.descriptor.stages
+        switch stage {
+        case .translation: return "Translation (\(stages[1].service?.displayName ?? stages[1].displayName))"
+        case .voice: return "Voice (\(stages[2].service?.displayName ?? "system voice"))"
+        case .waiting: return "Waiting for the previous passage"
+        }
+    }
+    private static func color(_ stage: PassageTiming.Stage) -> Color {
+        switch stage { case .translation: .blue; case .voice: .purple; case .waiting: .orange }
+    }
+
+    /// The last passage as one bar: each stage's share of the time to translated speech.
+    private func stageBar(_ last: PassageTiming) -> some View {
+        let scale = max(3, timings.map(\.totalSeconds).max() ?? 0)
+        return GeometryReader { geometry in
+            HStack(spacing: 1) {
+                ForEach(last.stages, id: \.stage) { part in
+                    Rectangle().fill(Self.color(part.stage))
+                        .frame(width: max(2, geometry.size.width * part.seconds / scale))
+                        .help("\(name(part.stage)): \(seconds(part.seconds))")
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(height: 10).clipShape(RoundedRectangle(cornerRadius: 3))
+        .accessibilityElement().accessibilityLabel("Last passage: " + last.stages.map { "\(name($0.stage)) \(seconds($0.seconds))" }.joined(separator: ", "))
+    }
+
+    /// The last passages, one stacked bar each, with the median time to speech as a dashed line.
+    private var history: some View {
+        Chart {
+            ForEach(Array(timings.enumerated()), id: \.offset) { index, timing in
+                ForEach(timing.stages, id: \.stage) { part in
+                    BarMark(x: .value("Passage", String(index + 1)), y: .value("Seconds", part.seconds), width: .ratio(0.6))
+                        .foregroundStyle(by: .value("Stage", name(part.stage)))
+                }
+            }
+            if let median = median(\.totalSeconds) {
+                RuleMark(y: .value("Median", median)).lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3])).foregroundStyle(.secondary)
+            }
+        }
+        .chartForegroundStyleScale(domain: PassageTiming.Stage.allCases.map(name), range: PassageTiming.Stage.allCases.map(Self.color))
+        .chartYAxis { AxisMarks { value in AxisGridLine(); AxisValueLabel { if let v = value.as(Double.self) { Text(seconds(v)) } } } }
+        .chartLegend(position: .bottom, alignment: .leading)
+        .frame(height: 140)
+        .accessibilityLabel("Time to translated speech for the last \(timings.count) passages")
+    }
+
     private func compactLine(_ last: PassageTiming) -> some View {
         var parts = ["\(seconds(last.totalSeconds)) to speech"]
         if let value = last.translateSeconds { parts.append("translate \(seconds(value))") }
         if let value = last.voiceSeconds { parts.append("voice \(seconds(value))") }
         parts.append("wait \(seconds(last.waitSeconds))")
-        return Text("Last passage: " + parts.joined(separator: " · ") + " · median \(seconds(median(\.totalSeconds) ?? last.totalSeconds))")
-            .font(.caption).monospacedDigit().foregroundStyle(.secondary).lineLimit(2)
-            .accessibilityLabel("Last passage timing: " + parts.joined(separator: ", "))
+        return VStack(alignment: .leading, spacing: 4) {
+            if showsBar { stageBar(last) }
+            Text("\(seconds(last.totalSeconds)) to speech · median \(seconds(median(\.totalSeconds) ?? last.totalSeconds))")
+                .font(.caption).monospacedDigit().foregroundStyle(.secondary).lineLimit(1)
+                .accessibilityLabel("Last passage timing: " + parts.joined(separator: ", "))
+        }
     }
 
     private func table(_ last: PassageTiming) -> some View {
-        let speech = model.route == .fish ? "Fish Audio" : "ElevenLabs"
-        return VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
+            stageBar(last)
+            if timings.count > 1 { history }
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 5) {
                 GridRow {
                     Text("Stage").foregroundStyle(.secondary)
@@ -45,9 +102,9 @@ struct PipelineTimingView: View {
                     Text("Median of \(timings.count)").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
                 }
                 row("Passage heard", last.passageSeconds, median(\.passageSeconds))
-                row("Translation (OpenAI)", last.translateSeconds, median(\.translateSeconds))
-                row("Voice, first audio (\(speech))", last.voiceSeconds, median(\.voiceSeconds))
-                row("Waiting for the previous passage", last.waitSeconds, median(\.waitSeconds))
+                row(name(.translation), last.translateSeconds, median(\.translateSeconds), .translation)
+                row(name(.voice) + ", first audio", last.voiceSeconds, median(\.voiceSeconds), .voice)
+                row(name(.waiting), last.waitSeconds, median(\.waitSeconds), .waiting)
                 Divider().gridCellColumns(3)
                 GridRow {
                     Text("Pause to translated speech").fontWeight(.semibold)
@@ -74,9 +131,12 @@ struct PipelineTimingView: View {
         return text
     }
 
-    @ViewBuilder private func row(_ title: String, _ last: Double?, _ median: Double?) -> some View {
+    @ViewBuilder private func row(_ title: String, _ last: Double?, _ median: Double?, _ stage: PassageTiming.Stage? = nil) -> some View {
         GridRow {
-            Text(title)
+            HStack(spacing: 6) {
+                if let stage { Circle().fill(Self.color(stage)).frame(width: 8, height: 8).accessibilityHidden(true) }
+                Text(title)
+            }
             Text(last.map(seconds) ?? "–")
             Text(median.map(seconds) ?? "–")
         }

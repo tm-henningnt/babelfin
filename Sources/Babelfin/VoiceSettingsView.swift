@@ -111,6 +111,8 @@ struct VoiceSettingsView: View {
         Section {
             if model.route.descriptor.isDirect {
                 LabeledContent("Voice", value: "Follows the speaker")
+            } else if model.route.descriptor.speechService == nil {
+                LabeledContent("Voice", value: "The best system voice for the language")
             } else {
                 HStack(spacing: 12) {
                     Picker("Voice", selection: $model.voiceID) {
@@ -122,6 +124,7 @@ struct VoiceSettingsView: View {
                         .accessibilityLabel("Refresh voices").help("Refresh account voices")
                         .disabled(state.busy || !allAudioStopped())
                 }
+                SpeakerVoicesRows(model: model, voices: state.voices.filter(\.isReady), placeholder: provider == .fish ? "Default voice" : "Choose a voice")
                 HStack(spacing: 12) {
                     Picker("Preview through", selection: $state.outputUID) {
                         Text("Choose headphones").tag("")
@@ -162,6 +165,78 @@ struct VoiceSettingsView: View {
         .onChange(of: model.route) { _ in state.reset() }
         .onChange(of: allAudioStopped()) { stopped in if !stopped { state.cancel() } }
         .onDisappear { state.cancel() }
+    }
+}
+
+/// Voice per speaker: on a route that labels speakers live, Speaker 1, 2, … each get a voice in order.
+private struct SpeakerVoicesRows: View {
+    @ObservedObject var model: AppModel
+    var voices: [ProviderVoice]
+    var placeholder: String
+    private var enabled: Binding<Bool> {
+        Binding(get: { !model.speakerVoices.isEmpty },
+                set: { model.speakerVoices = $0 ? [model.voiceID, ""] : [] })
+    }
+    var body: some View {
+        if model.route.descriptor.liveSpeakerLabels {
+            Toggle("Voice per speaker", isOn: enabled).disabled(model.configurationLocked)
+            if !model.speakerVoices.isEmpty {
+                ForEach(model.speakerVoices.indices, id: \.self) { index in
+                    HStack(spacing: 8) {
+                        Picker("Speaker \(index + 1)", selection: Binding(
+                            get: { model.speakerVoices.indices.contains(index) ? model.speakerVoices[index] : "" },
+                            set: { value in if model.speakerVoices.indices.contains(index) { model.speakerVoices[index] = value } })) {
+                            Text(placeholder).tag("")
+                            let chosen = model.speakerVoices[index]
+                            if !chosen.isEmpty, !voices.contains(where: { $0.id == chosen }) { Text(VoiceNameCache.name(for: chosen) ?? "Saved voice").tag(chosen) }
+                            ForEach(voices) { Text($0.name).tag($0.id) }
+                        }
+                        Button { model.speakerVoices.remove(at: index) } label: { Image(systemName: "minus.circle") }
+                            .buttonStyle(.borderless).accessibilityLabel("Remove the voice for speaker \(index + 1)")
+                            .disabled(model.speakerVoices.count <= 1)
+                    }.disabled(model.configurationLocked)
+                }
+                HStack {
+                    Button("Add a speaker voice") { model.speakerVoices.append("") }
+                        .disabled(model.configurationLocked || model.speakerVoices.count >= TranslationConfiguration.maximumSpeakerVoices)
+                    Spacer()
+                }
+                Text("Fish Audio labels the speakers in order of appearance. With more speakers than voices, the voices repeat. Turning this on or off applies after Restart.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        } else if !model.route.descriptor.isDirect {
+            Text("Speaker voices need Fish Audio recognition.").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// The voice row of the main window: the account's voices as a menu, loaded once when shown.
+/// Settings keeps preview and voice creation.
+struct MainVoicePicker: View {
+    @ObservedObject var model: AppModel
+    @StateObject private var state = VoiceSettingsState()
+    private var provider: VoiceProvider { model.route.descriptor.speechService == .fish ? .fish : .elevenLabs }
+    var body: some View {
+        if model.route.descriptor.isDirect {
+            Text("Follows the speaker")
+        } else if model.route.descriptor.speechService == nil {
+            Text("System voice")
+        } else {
+            HStack(spacing: 8) {
+                Picker("Voice", selection: $model.voiceID) {
+                    Text(provider == .fish ? "Default voice" : "Choose a voice").tag("")
+                    if !model.voiceID.isEmpty, !state.voices.contains(where: { $0.id == model.voiceID }) {
+                        Text(model.voiceDisplayName).tag(model.voiceID)
+                    }
+                    ForEach(state.voices.filter(\.isReady)) { Text($0.name).tag($0.id) }
+                }.labelsHidden().disabled(model.configurationLocked || state.busy)
+                Button { state.refresh(provider) } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Refresh account voices").accessibilityLabel("Refresh voices")
+                    .disabled(state.busy)
+            }
+            .onAppear { if state.voices.isEmpty { state.refresh(provider) } }
+            .onChange(of: model.route) { _ in state.reset(); state.refresh(provider) }
+        }
     }
 }
 

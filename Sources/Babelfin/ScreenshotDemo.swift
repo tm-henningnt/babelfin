@@ -35,13 +35,22 @@ import BridgeCore
                                                      output: SavedAudioDevice(uid: "demo-headphones", name: "Headphones"))
         func model(_ preferences: AppPreferences) -> AppModel {
             AppModel(providerFactory: { OpenAITranslationProvider() }, deviceList: { devices },
-                     preferences: MemoryAppPreferences(preferences), keyPresence: { true }, serviceKeyPresence: { _ in true },
+                     preferences: MemoryAppPreferences(preferences), serviceKeyPresence: { _ in true },
                      providerResolver: { ProviderFactory.make($0) }, loadProviderCredentials: { _ in throw BridgeError.unavailable("Demo") })
         }
         let incoming = model(incomingPreferences)
         incoming.destination = .listen
         let conversation = ConversationModel(outgoing: model(outgoingPreferences), incoming: incoming)
         conversation.seedDemoTranscript()
+        // Twelve fictional passages, so the timing view has a history to draw.
+        let translate = [0.42, 0.38, 0.51, 0.36, 0.44, 0.40, 0.62, 0.39, 0.41, 0.37, 0.45, 0.40]
+        let voice = [0.55, 0.61, 0.58, 0.49, 0.72, 0.57, 0.66, 0.52, 0.60, 0.54, 0.58, 0.56]
+        let wait = [0.10, 0.00, 0.35, 0.05, 0.00, 0.80, 0.20, 0.00, 0.15, 0.00, 0.30, 0.05]
+        conversation.outgoing.seedDemoTimings((0..<12).map { index in
+            PassageTiming(passageSeconds: 4, translateSeconds: translate[index], voiceSeconds: voice[index], preparedAhead: index == 7,
+                          totalSeconds: index == 7 ? 0.25 : translate[index] + voice[index] + wait[index], speechSeconds: 4, rate: 1)
+        })
+        UserDefaults.standard.set(true, forKey: PipelineTimingPreferences.visible)
         return conversation
     }
 }

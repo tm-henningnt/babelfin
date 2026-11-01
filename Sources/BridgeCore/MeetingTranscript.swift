@@ -27,15 +27,17 @@ public struct MeetingTranscript: Codable, Sendable {
     public private(set) var entries: [Entry] = []
     public private(set) var sessions: [Session] = []
     public private(set) var limitReached = false
+    /// Names the user gave speaker labels, per session and direction. They stay on this Mac.
+    public private(set) var speakerNames: [String: String] = [:]
     public private(set) var skippedInvalidSegments = 0
     public let characterLimit: Int
     private var indices: [String: Int] = [:]
     private var characterCount = 0
     private var rebuildIndices = true
-    private enum CodingKeys: String, CodingKey { case entries, sessions, limitReached, skippedInvalidSegments, characterLimit }
+    private enum CodingKeys: String, CodingKey { case entries, sessions, limitReached, skippedInvalidSegments, characterLimit, speakerNames }
     public init(characterLimit: Int = 2_000_000) { self.characterLimit = max(1, characterLimit) }
     public mutating func clear() {
-        entries = []; sessions = []; limitReached = false; skippedInvalidSegments = 0
+        entries = []; sessions = []; limitReached = false; skippedInvalidSegments = 0; speakerNames = [:]
         indices = [:]; characterCount = 0; rebuildIndices = false
     }
     public mutating func begin(sessionID: UUID, direction: ConversationDirection, at time: Date = Date()) {
@@ -121,11 +123,24 @@ public struct MeetingTranscript: Codable, Sendable {
     private static func key(_ session: UUID, _ direction: ConversationDirection, _ role: TranscriptRole, _ provenance: Provenance, _ id: String) -> String {
         "\(session.uuidString)/\(direction.rawValue)/\(role.rawValue)/\(provenance.rawValue)/\(id)"
     }
+    private static func speakerKey(_ entry: Entry, _ speaker: String) -> String {
+        "\(entry.sessionID.uuidString)/\(entry.direction.rawValue)/\(speaker)"
+    }
+    /// The entry's speaker as shown: the user's name for the label, or "Speaker N". Nil without a label.
+    public func speakerLabel(_ entry: Entry) -> String? {
+        entry.segment.speaker.map { speakerNames[Self.speakerKey(entry, $0)] ?? "Speaker \($0)" }
+    }
+    /// Names the entry's speaker for its session and direction. An empty name restores "Speaker N".
+    public mutating func renameSpeaker(of entry: Entry, to name: String) {
+        guard let speaker = entry.segment.speaker else { return }
+        let trimmed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
+        speakerNames[Self.speakerKey(entry, speaker)] = trimmed.isEmpty ? nil : trimmed
+    }
     public func plainText(selection: TranscriptExport.Selection = .both) -> String {
         let selected = entries.filter { selection == .both || (selection == .source ? $0.role == .source : $0.role == .target) }
         let content = selected.map { entry in
             let role = entry.role == .source ? "Original" : "Translation"
-            let speaker = entry.segment.speaker.map { " · Speaker \($0)" } ?? ""
+            let speaker = speakerLabel(entry).map { " · \($0)" } ?? ""
             return "\(entry.direction.label) · \(role)\(speaker)\n\(entry.segment.text)"
         }.joined(separator: "\n\n")
         let formatter = ISO8601DateFormatter()

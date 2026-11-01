@@ -67,46 +67,39 @@ struct AudioDriverSettingsView: View {
     @StateObject private var state = AudioDriverSettingsState()
     private var editsAllowed: Bool { !conversation.locked && !state.working }
 
+    /// Form sections for Settings › Audio devices.
     var body: some View {
-        VStack(spacing: 0) {
-            SettingsHeading(title: "Audio devices",
-                detail: "Babelfin Microphone sends your translated speech to a meeting app. Babelfin Speaker brings the meeting's audio to Babelfin for Listen.")
-            Form {
-                Section {
-                    LabeledContent("Status") {
-                        if let status = state.status { Text(status.text) } else { ProgressView().controlSize(.small) }
-                    }
-                    HStack {
-                        Button("Install") { Task { await state.install(conversation: conversation) } }
-                            .disabled(!editsAllowed || !state.bundled || state.status == .installed)
-                        Button("Remove", role: .destructive) { Task { await state.remove(conversation: conversation) } }
-                            .disabled(!editsAllowed || state.status == nil || state.status == .notInstalled)
-                        if state.working { ProgressView().controlSize(.small) }
-                    }
-                    Text("macOS asks for an administrator password, and Mac audio stops for a few seconds. Babelfin never changes your system audio defaults.")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    if conversation.locked {
-                        Text("Stop translation and turn off Ready for calls before you install or remove the devices.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if state.status != nil && !state.bundled {
-                        Text(AudioDriverInstallerError.missingBundles.localizedDescription).font(.caption).foregroundStyle(.secondary)
-                    }
-                    if !state.notice.isEmpty {
-                        Text(state.notice).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    }
-                } header: { Text("Babelfin audio devices") }
-                Section {
-                    Text("BlackHole 2ch and 16ch work instead. You do not need both.")
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("Babelfin Microphone and Babelfin Speaker are built from BlackHole by Existential Audio, licensed under GPL-3.0.")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 20) {
-                        Button("GPL-3.0 license") { AppLinks.openDriverLicense() }.buttonStyle(.link)
-                        Link("Driver source", destination: AppLinks.driverSource)
-                    }.font(.callout)
-                } header: { Text("Alternatives and license") }
-            }.formStyle(.grouped)
+        Section {
+            LabeledContent("Babelfin Microphone and Babelfin Speaker") {
+                if let status = state.status { Text(status.text).foregroundStyle(.secondary) } else { ProgressView().controlSize(.small) }
+            }
+            HStack {
+                if state.working { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Remove", role: .destructive) { Task { await state.remove(conversation: conversation) } }
+                    .disabled(!editsAllowed || state.status == nil || state.status == .notInstalled)
+                Button("Install") { Task { await state.install(conversation: conversation) } }
+                    .disabled(!editsAllowed || !state.bundled || state.status == .installed)
+            }
+            if conversation.locked {
+                Text("Stop translation and turn off Ready for calls first.").foregroundStyle(.secondary)
+            }
+            if state.status != nil && !state.bundled {
+                Text(AudioDriverInstallerError.missingBundles.localizedDescription).foregroundStyle(.secondary)
+            }
+            if !state.notice.isEmpty {
+                Text(state.notice).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        } header: { Text("Babelfin audio drivers") } footer: {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Installing asks for an administrator password and stops Mac audio for a few seconds. BlackHole 2ch and 16ch work instead.")
+                HStack(spacing: 16) {
+                    Text("Built from BlackHole by Existential Audio.")
+                    Button("GPL-3.0 License") { AppLinks.openDriverLicense() }.buttonStyle(.link)
+                    Link("Source", destination: AppLinks.driverSource)
+                }
+            }
+            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         .task { await state.refresh() }
         .onReceive(NotificationCenter.default.publisher(for: .babelfinAudioDevicesChanged)) { _ in

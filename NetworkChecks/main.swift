@@ -38,9 +38,29 @@ final class FakeSocket: ProviderWebSocket, @unchecked Sendable {
         iterator = SocketIterator(events.makeAsyncIterator())
     }
     func emit(_ object: [String: Any]) { continuation.yield(json(object)) }
+    let binary = Box<[Data]>([])
     func send(_ text: String) async throws { sent.change { $0.append(text) } }
+    func send(data: Data) async throws { binary.change { $0.append(data) } }
+    func emitBinary(_ data: Data) { continuation.yield(data) }
+    /// The service closes the connection.
+    func close() { continuation.finish(throwing: URLError(.networkConnectionLost)) }
     func receive() async throws -> Data { try await iterator.next() }
     func cancel() { cancelled.change { $0 = true }; continuation.finish(throwing: CancellationError()) }
+}
+/// A scripted on-device engine: the check emits results and observes passage ends.
+final class FakeLocalEngine: LocalTranscriptionEngine, @unchecked Sendable {
+    let appended = Box(0), passages = Box(0), finished = Box(false), cancelled = Box(false)
+    private var continuation: AsyncThrowingStream<LocalTranscript, Error>.Continuation?
+    var closesOnFinish = true
+    func start(language: String) async throws -> AsyncThrowingStream<LocalTranscript, Error> {
+        AsyncThrowingStream { continuation = $0 }
+    }
+    func append(_ pcm: Data) throws { appended.change { $0 += pcm.count } }
+    func finalizePassage() async throws { passages.change { $0 += 1 } }
+    func finish() async throws { finished.change { $0 = true }; if closesOnFinish { continuation?.finish() } }
+    func cancel() async { cancelled.change { $0 = true } }
+    func emit(_ text: String, final: Bool) { continuation?.yield(LocalTranscript(text: text, isFinal: final)) }
+    func fail() { continuation?.finish(throwing: CancellationError()) }
 }
 /// Fixture has exactly one receive caller, matching URLSessionWebSocketTask.
 final class SocketIterator: @unchecked Sendable {
@@ -292,6 +312,201 @@ final class LoopbackHTTPFixture: @unchecked Sendable {
         try await rejects { try await wrongFormatRecognizer.start(configuration: .init(targetLanguage: "en"), credentials: credentials) }
         try expect(wrongFormatSocket.cancelled.get(), "Mismatch session format must close before upload")
         passed("Scribe rejects mismatched negotiated audio before capture upload")
+        // A final transcript that never arrives must fail finish, so the last sentence is not lost silently.
+        func expectUnconfirmed(_ recognizer: any StreamingSpeechRecognizer, closed: () -> Bool, _ name: String) async throws {
+            do { try await recognizer.finish(); throw CheckFailure(message: "\(name) finish succeeded without a final transcript") }
+            catch let error as BridgeError { try expect(error.localizedDescription.contains("not confirmed") && !closed(), "\(name) unconfirmed final fails without closing") }
+        }
+        let silentScribeSocket = FakeSocket(); silentScribeSocket.emit(["message_type": "session_started", "session_id": "session-fixture", "config": ["sample_rate": 24_000, "audio_format": "pcm_24000", "model_id": "scribe_v2_realtime"]])
+        let silentScribe = ElevenLabsSpeechRecognizer(finishTimeout: 0.08) { _ in silentScribeSocket }
+        var silentScribeClosed = false, silentScribeSegments = 0
+        silentScribe.onEvent = { event in if case .closed = event { silentScribeClosed = true }; if case .segment = event { silentScribeSegments += 1 } }
+        try await silentScribe.start(configuration: .init(targetLanguage: "en"), credentials: credentials)
+        try silentScribe.append(Data([1,2])); try await eventually { silentScribeSocket.sent.get().count == 1 }
+        silentScribeSocket.emit(["message_type": "partial_transcript", "text": "The last sentence"])
+        try await eventually { silentScribeSegments == 1 }
+        try await expectUnconfirmed(silentScribe, closed: { silentScribeClosed }, "Scribe")
+        let silentLiveSocket = FakeSocket(); silentLiveSocket.emit(["type": "session.updated"])
+        let silentLive = OpenAILiveRecognizer(finishTimeout: 0.5) { _ in silentLiveSocket }
+        var silentLiveClosed = false
+        silentLive.onEvent = { if case .closed = $0 { silentLiveClosed = true } }
+        try await silentLive.start(configuration: .init(targetLanguage: "en", sourceLanguage: "no"), credentials: .init(openAI: "synthetic-openai"))
+        try silentLive.append(Data(repeating: 0, count: 480)); try await eventually { silentLiveSocket.sent.get().count == 2 }
+        silentLiveSocket.emit(["type": "input_audio_buffer.committed", "item_id": "item-last"])
+        silentLiveSocket.emit(["type": "conversation.item.input_audio_transcription.delta", "item_id": "item-last", "delta": "The last"])
+        try await expectUnconfirmed(silentLive, closed: { silentLiveClosed }, "OpenAI live transcription")
+        let silentFishSocket = FakeSocket(); silentFishSocket.emitBinary(MessagePack.encode(.map(["type": .string("session_started")])))
+        let silentFish = FishLiveRecognizer(finishTimeout: 0.2) { _ in silentFishSocket }
+        var silentFishClosed = false
+        silentFish.onEvent = { if case .closed = $0 { silentFishClosed = true } }
+        try await silentFish.start(configuration: .init(targetLanguage: "no", sourceLanguage: "en"), credentials: .init(fish: "synthetic-fish"))
+        try silentFish.append(Data(repeating: 0, count: 480)); try await eventually { silentFishSocket.binary.get().count == 2 }
+        try await expectUnconfirmed(silentFish, closed: { silentFishClosed }, "Fish")
+        passed("Recognizers fail finish when the final transcript is not confirmed")
+        let localEngine = FakeLocalEngine()
+        let local = AppleLocalRecognizer(engine: localEngine, finishTimeout: 0.3)
+        var localSegments: [TranscriptSegment] = [], localClosed = false
+        local.onEvent = { event in
+            switch event { case .segment(let segment): localSegments.append(segment); case .closed: localClosed = true; default: break }
+        }
+        try await rejects { try await AppleLocalRecognizer(engine: FakeLocalEngine()).start(configuration: .init(targetLanguage: "en"), credentials: .init()) }
+        try await local.start(configuration: .init(targetLanguage: "en", sourceLanguage: "no"), credentials: .init())
+        localEngine.emit("God", final: false); localEngine.emit("God morgen", final: false); localEngine.emit("God morgen.", final: true)
+        localEngine.emit("Velkommen", final: false)
+        try await eventually { localSegments.count == 4 }
+        try expect(localSegments.map(\.id) == ["local-0", "local-0", "local-0", "local-1"] && localSegments.map(\.revision) == [1, 2, 3, 1]
+                   && localSegments.map(\.isFinal) == [false, false, true, false] && localSegments[2].language == "no",
+                   "On-device results revise one passage until it is final; the next passage gets a new id")
+        // 4.5 s of speech, then 0.5 s of silence: the cutter ends the passage once.
+        let speech = PCM16.encode([Float](repeating: 0.3, count: 2_400)), pause = Data(repeating: 0, count: 4_800)
+        for _ in 0..<45 { try local.append(speech) }
+        for _ in 0..<5 { try local.append(pause) }
+        try await eventually { localEngine.passages.get() == 1 }
+        try expect(localEngine.appended.get() == 45 * 4_800 + 5 * 4_800, "Every packet reaches the engine")
+        localEngine.emit("Velkommen til møtet.", final: true)
+        try await local.finish()
+        try expect(localEngine.finished.get() && localClosed && localSegments.last?.text == "Velkommen til møtet." && localSegments.last?.isFinal == true,
+                   "Finish ends the input, waits for the last final result and closes")
+        let stuckEngine = FakeLocalEngine(); stuckEngine.closesOnFinish = false
+        let stuck = AppleLocalRecognizer(engine: stuckEngine, finishTimeout: 0.2)
+        var stuckClosed = false
+        stuck.onEvent = { if case .closed = $0 { stuckClosed = true } }
+        try await stuck.start(configuration: .init(targetLanguage: "en", sourceLanguage: "no"), credentials: .init())
+        try await expectUnconfirmed(stuck, closed: { stuckClosed }, "On-device recognition")
+        let brokenEngine = FakeLocalEngine()
+        let broken = AppleLocalRecognizer(engine: brokenEngine)
+        var brokenFailures: [String] = []
+        broken.onEvent = { if case .failure(let text) = $0 { brokenFailures.append(text) } }
+        try await broken.start(configuration: .init(targetLanguage: "en", sourceLanguage: "no"), credentials: .init())
+        brokenEngine.fail()
+        try await eventually { brokenFailures.count == 1 }
+        try await eventually { brokenEngine.cancelled.get() }
+        try await rejects { try broken.append(speech) }
+        passed("On-device recognition: passages, revisions, passage ends, finish and engine failure")
+        let liveSocket = FakeSocket(); liveSocket.emit(["type": "session.updated"])
+        let live = OpenAILiveRecognizer(finishTimeout: 0.5) { request in liveSocket.requests.change { $0.append(request) }; return liveSocket }
+        var liveSegments: [TranscriptSegment] = []
+        live.onEvent = { if case .segment(let segment) = $0 { liveSegments.append(segment) } }
+        try await live.start(configuration: .init(targetLanguage: "en", sourceLanguage: "no"), credentials: .init(openAI: "synthetic-openai"))
+        let liveRequest = liveSocket.requests.get()[0]
+        let update = try JSONSerialization.jsonObject(with: Data(liveSocket.sent.get()[0].utf8)) as! [String: Any]
+        let input = ((update["session"] as? [String: Any])?["audio"] as? [String: Any])?["input"] as? [String: Any]
+        let transcription = input?["transcription"] as? [String: Any]
+        try expect(liveRequest.url?.query == "intent=transcription" && liveRequest.value(forHTTPHeaderField: "Authorization") == "Bearer synthetic-openai"
+                   && update["type"] as? String == "session.update" && transcription?["model"] as? String == "gpt-live-transcribe"
+                   && transcription?["languages"] as? [String] == ["no"] && input?["turn_detection"] is NSNull
+                   && !liveSocket.sent.get()[0].contains("synthetic-openai"), "Live transcription session uses the documented configuration")
+        try live.append(Data(repeating: 0, count: 480)); try await eventually { liveSocket.sent.get().count == 2 }
+        liveSocket.emit(["type": "input_audio_buffer.committed", "item_id": "item-a"])
+        liveSocket.emit(["type": "input_audio_buffer.committed", "item_id": "item-b"])
+        liveSocket.emit(["type": "conversation.item.input_audio_transcription.delta", "item_id": "item-b", "content_index": 0, "delta": "Second"])
+        liveSocket.emit(["type": "conversation.item.input_audio_transcription.completed", "item_id": "item-b", "content_index": 0, "transcript": "Second."])
+        liveSocket.emit(["type": "conversation.item.input_audio_transcription.delta", "item_id": "item-a", "content_index": 0, "delta": "Fir"])
+        liveSocket.emit(["type": "conversation.item.input_audio_transcription.delta", "item_id": "item-a", "content_index": 0, "delta": "st"])
+        try await eventually { liveSegments.count == 3 }
+        try expect(liveSegments.allSatisfy { !$0.isFinal } && liveSegments.last?.text == "First" && liveSegments.last?.revision == 2,
+                   "A later passage's final waits for the earlier passage; deltas accumulate")
+        liveSocket.emit(["type": "conversation.item.input_audio_transcription.completed", "item_id": "item-a", "content_index": 0, "transcript": "First."])
+        try await eventually { liveSegments.filter(\.isFinal).count == 2 }
+        let liveFinals = liveSegments.filter(\.isFinal)
+        try expect(liveFinals.map(\.text) == ["First.", "Second."] && liveFinals[0].id == "openai-item-a" && liveFinals[0].revision > 2,
+                   "Finals arrive in commit order with a newer revision than their partials")
+        let liveFinish = Task { try await live.finish() }
+        try await eventually { liveSocket.sent.get().last == #"{"type":"input_audio_buffer.commit"}"# }
+        liveSocket.emit(["type": "error", "error": ["code": "input_audio_buffer_commit_empty", "message": "empty"]])
+        try await liveFinish.value
+        var cutter = SegmentCutter(serviceCommitSeconds: 0.45, commitsOnSilence: true)
+        let loud = Data((0..<2_400).flatMap { i -> [UInt8] in let v = UInt16(bitPattern: Int16(i % 2 == 0 ? 8_000 : -8_000)); return [UInt8(v & 0xff), UInt8(v >> 8)] })
+        let quiet = Data(repeating: 0, count: 4_800)
+        let commits = ([loud] + Array(repeating: quiet, count: 10)).map { cutter.commitAfter($0) }
+        try expect(commits.filter { $0 }.count == 1 && !commits[0], "Without service turn detection the cutter commits once at the end of speech")
+        passed("OpenAI live transcription: session, ordered finals, final commit and end-of-speech commits")
+        let packSample: MessagePackValue = .map(["type": .string("committed"), "turn_index": .int(300), "neg": .int(-5), "big": .int(-70_000),
+                                             "ratio": .double(0.5), "ok": .bool(true), "none": .null, "data": .binary(Data(repeating: 7, count: 300)),
+                                             "list": .array([.int(1), .string(String(repeating: "x", count: 40))])])
+        let roundTrip = try MessagePack.decode(MessagePack.encode(packSample)), one = try MessagePack.decode(Data([0xcb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0]))
+        try expect(roundTrip == packSample, "MessagePack round trip")
+        try expect(one == .double(1)
+                   && (try? MessagePack.decode(Data([0xa5, 0x61]))) == nil && (try? MessagePack.decode(Data([0xdd, 0xff, 0xff, 0xff, 0xff]))) == nil
+                   && (try? MessagePack.decode(Data(repeating: 0x91, count: 40) + Data([0x00]))) == nil,
+                   "MessagePack rejects truncated input, impossible lengths and deep nesting")
+        let fishSocket = FakeSocket()
+        fishSocket.emitBinary(MessagePack.encode(.map(["type": .string("session_started"), "seq": .int(0), "session_id": .string("s")])))
+        let fish = FishLiveRecognizer(finishTimeout: 0.5) { request in fishSocket.requests.change { $0.append(request) }; return fishSocket }
+        var fishSegments: [TranscriptSegment] = []
+        fish.onEvent = { if case .segment(let segment) = $0 { fishSegments.append(segment) } }
+        try await fish.start(configuration: .init(targetLanguage: "no", sourceLanguage: "en"), credentials: .init(fish: "synthetic-fish"))
+        let fishRequest = fishSocket.requests.get()[0], fishConfig = try MessagePack.decode(fishSocket.binary.get()[0])
+        try expect(fishRequest.value(forHTTPHeaderField: "Authorization") == "Bearer synthetic-fish" && fishRequest.value(forHTTPHeaderField: "model") == "transcribe-stream-1"
+                   && fishConfig["type"]?.string == "config" && fishConfig["audio"]?["sample_rate"]?.int == 24_000 && fishConfig["turn_detection"]?["mode"]?.string == "manual"
+                   && fishSocket.sent.get().isEmpty, "Fish session sends a binary MessagePack config with manual turns")
+        try fish.append(Data(repeating: 0, count: 480)); try await eventually { fishSocket.binary.get().count == 2 }
+        let audioFrame = try MessagePack.decode(fishSocket.binary.get()[1])
+        try expect(audioFrame["data"] == .binary(Data(repeating: 0, count: 480)), "Audio goes as MessagePack binary")
+        fishSocket.emitBinary(MessagePack.encode(.map(["type": .string("draft"), "seq": .int(1), "turn_index": .int(0), "text": .string("Hello")])))
+        fishSocket.emitBinary(MessagePack.encode(.map(["type": .string("committed"), "seq": .int(2), "turn_index": .int(0), "text": .string("Hello there."),
+                                                       "turn_kind": .string("user"), "language_code": .string("en")])))
+        fishSocket.emitBinary(MessagePack.encode(.map(["type": .string("committed"), "seq": .int(3), "turn_index": .int(1), "text": .string("Mm."),
+                                                       "turn_kind": .string("backchannel")])))
+        fishSocket.emitBinary(MessagePack.encode(.map(["type": .string("error"), "seq": .int(4), "recoverable": .bool(true), "error_type": .string("engine_error")])))
+        try await eventually { fishSegments.count == 2 }
+        try expect(fishSegments[0].id == fishSegments[1].id && !fishSegments[0].isFinal && fishSegments[1].isFinal && fishSegments[1].revision == 2
+                   && fishSegments[1].language == "en", "Fish drafts revise one turn until it commits; non-user turns and recoverable errors are skipped")
+        let fishFinish = Task { try await fish.finish() }
+        try await eventually { (try? MessagePack.decode(fishSocket.binary.get().last ?? Data()))?["type"]?.string == "audio_done" }
+        fishSocket.emitBinary(MessagePack.encode(.map(["type": .string("session_done"), "seq": .int(5)])))
+        fishSocket.close()
+        try await fishFinish.value
+        try expect(fishSegments.count == 2, "Fish finish waits for session_done and accepts the close that follows it")
+        let droppedSocket = FakeSocket()
+        droppedSocket.emitBinary(MessagePack.encode(.map(["type": .string("session_started")])))
+        let dropped = FishLiveRecognizer(finishTimeout: 0.5) { _ in droppedSocket }
+        var droppedEvents: [String] = []
+        dropped.onEvent = { event in
+            switch event { case .segment(let segment): droppedEvents.append(segment.text); case .failure(let text): droppedEvents.append(text); default: break }
+        }
+        try await dropped.start(configuration: .init(targetLanguage: "no", sourceLanguage: "en"), credentials: .init(fish: "synthetic-fish"))
+        droppedSocket.emitBinary(MessagePack.encode(.map(["type": .string("committed"), "turn_index": .int(0), "text": .string("Last words."), "turn_kind": .string("user")])))
+        droppedSocket.close()
+        try await eventually { droppedEvents.count == 2 }
+        try expect(droppedEvents == ["Last words.", "Speech recognition connection failed."],
+                   "A dropped connection delivers the transcripts already received, then reports the failure once")
+        passed("Fish recognition: MessagePack codec, binary session, drafts, user turns and audio_done finish")
+        try expect(fishConfig["results"]?["diarize"] == .bool(false), "Without speaker voices Fish does not label speakers")
+        let parts = FishLiveRecognizer.speakerParts("Intro. <|speaker:3|> Hello there. <|speaker:0|> Hi! <|speaker:3|>  ")
+        try expect(parts.map(\.speaker) == [nil, 3, 0] && parts.map(\.text) == ["Intro.", "Hello there.", "Hi!"],
+                   "Speaker tags split the text; a part before a tag has no speaker; empty parts are dropped")
+        let labelSocket = FakeSocket()
+        labelSocket.emitBinary(MessagePack.encode(.map(["type": .string("session_started")])))
+        let labelled = FishLiveRecognizer(finishTimeout: 0.5) { _ in labelSocket }
+        var labelSegments: [TranscriptSegment] = []
+        labelled.onEvent = { if case .segment(let segment) = $0 { labelSegments.append(segment) } }
+        try await labelled.start(configuration: .init(targetLanguage: "no", sourceLanguage: "en", speakerVoices: ["a", "b"]), credentials: .init(fish: "synthetic-fish"))
+        let labelConfig = try MessagePack.decode(labelSocket.binary.get()[0])
+        try expect(labelConfig["results"]?["diarize"] == .bool(true), "Speaker voices turn Fish diarization on")
+        labelSocket.emitBinary(MessagePack.encode(.map(["type": .string("draft"), "turn_index": .int(0), "text": .string("<|speaker:5|> Good morning")])))
+        labelSocket.emitBinary(MessagePack.encode(.map(["type": .string("committed"), "turn_index": .int(0), "turn_kind": .string("user"),
+                                                         "text": .string("<|speaker:5|> Good morning. <|speaker:2|> Morning!")])))
+        labelSocket.emitBinary(MessagePack.encode(.map(["type": .string("committed"), "turn_index": .int(1), "turn_kind": .string("user"),
+                                                         "text": .string("<|speaker:2|> Shall we start?")])))
+        try await eventually { labelSegments.count == 4 }
+        try expect(labelSegments[0].text == "Good morning" && labelSegments[0].speaker == nil && !labelSegments[0].isFinal
+                   && labelSegments[1...].map(\.speaker) == ["1", "2", "2"] && labelSegments[1...].map(\.id) == ["fish-0", "fish-0.1", "fish-1"]
+                   && labelSegments[1...].allSatisfy(\.isFinal),
+                   "Drafts hide tags; committed parts get labels in order of appearance and their own ids")
+        labelled.cancel()
+        var named = MeetingTranscript()
+        let session = UUID()
+        named.begin(sessionID: session, direction: .incoming)
+        named.receive(.segment(TranscriptSegment(id: "x", text: "Hei.", isFinal: true, speaker: "1"), role: .source), sessionID: session, direction: .incoming)
+        let entry = named.entries[0]
+        named.renameSpeaker(of: entry, to: "  Anna  ")
+        let namedJSON = String(decoding: try named.jsonData(), as: UTF8.self)
+        try expect(named.speakerLabel(entry) == "Anna" && named.plainText().contains("· Anna\nHei.") && namedJSON.contains("\"Anna\""),
+                   "A renamed speaker shows in the transcript, TXT and JSON")
+        named.renameSpeaker(of: entry, to: "")
+        try expect(named.speakerLabel(entry) == "Speaker 1", "An empty name restores the label")
+        passed("Speaker labels: Fish diarization, tag parsing, label order and renaming")
         let badSocket = FakeSocket(); badSocket.emit(["message_type": "session_started", "session_id": "session-fixture", "config": ["sample_rate": 24_000, "audio_format": "pcm_24000", "model_id": "scribe_v2_realtime"]])
         let badRecognizer = ElevenLabsSpeechRecognizer { _ in badSocket }
         var safeFailure = ""

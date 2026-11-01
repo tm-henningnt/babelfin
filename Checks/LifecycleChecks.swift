@@ -434,9 +434,17 @@ private final class InventoryFixture: @unchecked Sendable {
                 await app.stop()
             }),
             ("Every registered stage has a factory, and routes decode only by known ID", {
-                let serverWasAvailable = ProviderRegistry.translationServerAvailable
-                defer { ProviderRegistry.translationServerAvailable = serverWasAvailable }
+                let serverWasAvailable = ProviderRegistry.translationServerAvailable, localWas = ProviderRegistry.localLanguages
+                defer { ProviderRegistry.translationServerAvailable = serverWasAvailable; ProviderRegistry.localLanguages = localWas }
                 ProviderRegistry.translationServerAvailable = true
+                let norwegian = TranslationLanguage(code: "no", name: "Norwegian"), english = TranslationLanguage(code: "en", name: "English"),
+                    german = TranslationLanguage(code: "de", name: "German")
+                ProviderRegistry.localLanguages = .init(recognition: [english, norwegian], translation: [english, german, norwegian], speech: [english, norwegian])
+                let local = TranslationRoute.appleLocal.descriptor
+                try require(TranslationRoute.allCases.contains(.appleLocal) && local.services.isEmpty && TranslationRoute.appleLocal.requiredServices.isEmpty,
+                            "The on-device route is offered once its languages load, and needs no account")
+                try require(local.inputLanguages.map(\.code) == ["en", "no"] && local.outputLanguages.map(\.code) == ["en", "no"] && local.nativeSpeakingRate,
+                            "On-device inputs come from recognition; outputs are voices that translation can produce")
                 try require(TranslationRoute(rawValue: "fish-server")?.requiredServices == [.elevenLabs, .fish],
                             "A server route must need only the speech accounts")
                 for stage in ProviderRegistry.stages {
@@ -456,6 +464,9 @@ private final class InventoryFixture: @unchecked Sendable {
                 try require(TranslationRoute(rawValue: "fish") == .fish && TranslationRoute(rawValue: "unknown") == nil, "Route IDs must decode only when registered")
                 ProviderRegistry.translationServerAvailable = false
                 try require(TranslationRoute(rawValue: "fish-server") == nil, "Server routes must disappear without a saved server")
+                ProviderRegistry.localLanguages = nil
+                try require(!TranslationRoute.allCases.contains(.appleLocal) && TranslationRoute(rawValue: "apple-local") == .appleLocal,
+                            "Before its languages load, the on-device route is not offered but a saved choice still decodes")
                 let encoded = try JSONEncoder().encode([TranslationRoute.elevenLabs])
                 let decoded = try JSONDecoder().decode([TranslationRoute].self, from: encoded)
                 try require(String(decoding: encoded, as: UTF8.self) == "[\"elevenlabs\"]" && decoded == [.elevenLabs], "Route must encode as its ID")

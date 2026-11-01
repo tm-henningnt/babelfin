@@ -6,5 +6,5 @@ mkdir -p "$OUT"
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang-cache"
 source scripts/build-bridge-core.sh
 build_bridge_core "$OUT" -strict-concurrency=complete -warn-concurrency
-swiftc -parse-as-library -I "$OUT" -L "$OUT" -lBridgeCore -Xlinker -rpath -Xlinker "$OUT" Sources/Babelfin/ProviderNetwork.swift Sources/Babelfin/ComposedNetworkStages.swift Sources/Babelfin/SpeechToolsService.swift Sources/Babelfin/OpenAIRecordingTranscriber.swift OpenAIRecordingChecks/main.swift -o "$OUT/OpenAIRecordingChecks" -strict-concurrency=complete -warn-concurrency -warnings-as-errors
+swiftc -parse-as-library -I "$OUT" -L "$OUT" -lBridgeCore -Xlinker -rpath -Xlinker "$OUT" Sources/Babelfin/ProviderNetwork.swift Sources/Babelfin/ComposedNetworkStages.swift Sources/Babelfin/SpeechToolsService.swift Sources/Babelfin/AppleLocalStages.swift Sources/Babelfin/OpenAIRecordingTranscriber.swift OpenAIRecordingChecks/main.swift -o "$OUT/OpenAIRecordingChecks" -strict-concurrency=complete -warn-concurrency -warnings-as-errors
 "$OUT/OpenAIRecordingChecks"

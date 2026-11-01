@@ -42,6 +42,9 @@ import BridgeCore
         #if canImport(MicrosoftCognitiveServicesSpeech)
         ProviderRegistry.azureAvailable = true
         #endif
+        #if canImport(Speech) && canImport(Translation)
+        if #available(macOS 26.0, *) { Task { ProviderRegistry.localLanguages = await LocalLanguageLoader.load() } }
+        #endif
         #if BABELFIN_SCREENSHOTS
         let instance = ScreenshotDemo.conversation()
         #else
@@ -56,33 +59,49 @@ import BridgeCore
     }
     var body: some Scene {
         Window("Babelfin", id: "main") { ConversationView(conversation: conversation) }
-            .defaultSize(width: 980, height: 700)
+            .defaultSize(width: 1120, height: 740)
             .windowResizability(.automatic)
             .commands {
                 CommandGroup(replacing: .appInfo) {
                     AboutButton()
                     Button("Check for Updates…") { UpdatesWindow.show(beforeQuit: {}) }
                 }
-                CommandGroup(replacing: .help) { Button("Babelfin Help") { AppLinks.openHelp() } }
+                CommandGroup(replacing: .help) {
+                    Button("Babelfin Help") { AppLinks.openHelp() }.keyboardShortcut("?")
+                    Button("Set Up a Call…") { HelpWindow.show(topic: "Be heard in a call") }
+                    Link("Babelfin Website", destination: AppLinks.website)
+                }
                 CommandMenu("Translation") {
                     DirectionCommands(model: conversation.outgoing, title: "Speak", modifiers: [.command, .shift])
                     Divider()
                     DirectionCommands(model: conversation.incoming, title: "Listen", modifiers: [.command, .shift, .option])
                     Divider()
                     TurnBothOffButton(conversation: conversation).keyboardShortcut(".", modifiers: [.command, .shift])
+                    RestartBothButton(conversation: conversation).keyboardShortcut("r", modifiers: [.command, .shift])
                     Divider()
                     SubtitleToggleButton().keyboardShortcut("u", modifiers: [.command, .option])
                 }
                 CommandGroup(before: .windowList) {
-                    SectionButton(section: .outgoing).keyboardShortcut("1")
-                    SectionButton(section: .incoming).keyboardShortcut("2")
-                    SectionButton(section: .transcript).keyboardShortcut("3")
-                    SectionButton(section: .recording, title: "Audio tools").keyboardShortcut("u", modifiers: [.command, .shift])
+                    SectionButton(section: .home).keyboardShortcut("1")
+                    SectionButton(section: .transcript).keyboardShortcut("2")
+                    SectionButton(section: .tools).keyboardShortcut("3")
+                    CompactButton().keyboardShortcut("0")
                     Divider()
                 }
             }
         Settings { ConversationSettingsView(conversation: conversation) }
-        Window("About Babelfin", id: "about") { AboutView() }.windowResizability(.contentSize)
+        Window("Welcome to Babelfin", id: "welcome") { FirstRunView(conversation: conversation) }
+            .windowResizability(.contentSize)
+            .commandsRemoved()
+        Window("Compact Controls", id: "compact") { CompactWindow(conversation: conversation) }
+            .windowStyle(.hiddenTitleBar)
+            .windowResizability(.contentSize)
+            .commandsRemoved()
+        Window("About Babelfin", id: "about") { AboutView() }.windowResizability(.contentSize).commandsRemoved()
+        #if BABELFIN_SCREENSHOTS
+        // Private documentation build only: the menu bar panel in a window, for screenshots.
+        Window("Menu Bar Panel", id: "menu-preview") { ConversationMenu(conversation: conversation) }.windowResizability(.contentSize)
+        #endif
         MenuBarExtra { ConversationMenu(conversation: conversation) } label: {
             Label {
                 Text(conversation.active ? "Babelfin active" : "Babelfin stopped")
@@ -90,6 +109,7 @@ import BridgeCore
                 Image(nsImage: conversation.active ? MenuBarSymbol.live : MenuBarSymbol.idle).renderingMode(.template)
             }
         }
+        .menuBarExtraStyle(.window)
     }
 }
 
@@ -141,10 +161,45 @@ struct SectionButton: View {
     }
 }
 extension MainNavigation {
+    /// True until the main window first appears.
+    static var launching = true
+    /// Shows compact controls and closes the main window.
+    static func openCompact(openWindow: OpenWindowAction) {
+        openWindow(id: "compact"); NSApp.activate(ignoringOtherApps: true)
+        close("main")
+    }
+    /// Shows the main window at one section and closes compact controls.
     static func open(_ section: MainSection, openWindow: OpenWindowAction) {
-        UserDefaults.standard.set(false, forKey: "babelfin.compactControls.v1")
+        launching = false
         shared.section = section
         openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true)
+        close("compact")
+    }
+    /// SwiftUI names a window after its scene ID: "main", or "main-AppWindow-1" for a window group.
+    private static func close(_ scene: String) {
+        DispatchQueue.main.async {
+            for window in NSApp.windows {
+                guard let id = window.identifier?.rawValue, id == scene || id.hasPrefix(scene + "-") else { continue }
+                window.close()
+            }
+        }
+    }
+}
+/// Restarts each direction that has changes waiting for a restart.
+struct RestartBothButton: View {
+    @ObservedObject var conversation: ConversationModel
+    var body: some View {
+        Button("Restart to Apply Changes") { Task {
+            for model in [conversation.outgoing, conversation.incoming] where !model.pendingRestart.isEmpty { await model.restartTranslation() }
+        } }
+        .disabled(conversation.outgoing.pendingRestart.isEmpty && conversation.incoming.pendingRestart.isEmpty)
+    }
+}
+/// Opens the window as compact controls.
+struct CompactButton: View {
+    @Environment(\.openWindow) private var openWindow
+    var body: some View {
+        Button("Compact Controls") { MainNavigation.openCompact(openWindow: openWindow) }
     }
 }
 struct TurnBothOffButton: View {

@@ -9,18 +9,13 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            SettingsHeading(title: direction == .outgoing ? "Speak" : "Listen",
-                detail: direction == .outgoing ? "Choose how your translated speech sounds." : "Choose how you hear translated audio.")
             Form {
                 Section {
                     Picker("Service", selection: $model.route) {
                         ForEach(TranslationRoute.allCases) { Text($0.displayName).tag($0) }
                     }.disabled(model.configurationLocked)
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(serviceExplanation).font(.callout).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Button("Manage API keys…", action: openAccounts)
-                    }
+                    Text(serviceExplanation).font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 } header: { Text("Translation") }
                 Section {
                     Toggle("Speak the translation", isOn: $model.speakTranslation).disabled(model.configurationLocked)
@@ -41,14 +36,8 @@ struct SettingsView: View {
                         }
                         Toggle("Lower original audio while translation plays", isOn: $model.originalMixDucking)
                     }
-                    Text("Keep the original voice quietly underneath the translation. The two voices are not synchronized.")
-                        .font(.caption).foregroundStyle(.secondary)
                 } header: { Text("Original audio") }
                     .disabled(model.configurationLocked)
-                if model.translating {
-                    Section { Label("While translating, a new voice or output language applies at once on ElevenLabs and Fish Audio. Other changes apply when you choose Restart.", systemImage: "arrow.clockwise")
-                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
-                }
             }.formStyle(.grouped)
         }
         .onAppear { model.refresh(); model.refreshKeyStatus() }
@@ -70,33 +59,40 @@ struct AccountSettingsView: View {
     @ObservedObject private var activity = CredentialOperationActivity.shared
     @StateObject private var state = AccountSettingsState()
     private var editsAllowed: Bool { allAudioStopped() && !activity.active }
+    private var storageNote: String {
+        if state.needsSelection {
+            return "This Mac: files that only your macOS account can read, not encrypted, with no prompts after updates. Keychain: encrypted, and updates may ask for access again."
+        }
+        return (storageMode == .keychain ? "Encrypted by macOS Keychain. Updates may ask for access again."
+                : "Files that only your macOS account can read. Not encrypted. No prompts after updates.")
+            + " Changing storage does not move saved keys."
+    }
     var body: some View {
         VStack(spacing: 0) {
-            SettingsHeading(title: "Accounts", detail: "API keys for the services you use. Both directions share them, and each service bills your account separately.")
             Form {
                 Section {
                     if state.needsSelection {
-                        Text("Choose where to save your keys. This Mac is recommended for this unnotarized release. Local files are unencrypted and readable by apps running as your account. Existing keys stay where they are.")
-                            .fixedSize(horizontal: false, vertical: true)
-                        Button("Use This Mac (recommended)") {
+                        Text("Choose where Babelfin saves your keys.")
+                        HStack {
+                            Spacer()
+                            Button("Use Keychain") {
+                                guard editsAllowed else { return }
+                                storageMode = .keychain; state.needsSelection = false
+                            }.disabled(!editsAllowed)
+                            Button("Use This Mac (Recommended)") {
+                                guard editsAllowed else { return }
+                                storageMode = .localFile; state.needsSelection = false
+                            }.buttonStyle(.borderedProminent).disabled(!editsAllowed)
+                        }
+                    } else {
+                        Picker("Store keys in", selection: Binding(get: { storageMode }, set: { mode in
                             guard editsAllowed else { return }
-                            storageMode = .localFile; state.needsSelection = false
-                        }.disabled(!editsAllowed)
-                        Button("Use Keychain") {
-                            guard editsAllowed else { return }
-                            storageMode = .keychain; state.needsSelection = false
+                            storageMode = mode
+                        })) {
+                            ForEach(CredentialStorageMode.allCases) { Text($0.displayName).tag($0) }
                         }.disabled(!editsAllowed)
                     }
-                    Picker("Store keys in", selection: Binding(get: { storageMode }, set: { mode in
-                        guard editsAllowed else { return }
-                        storageMode = mode; state.needsSelection = false
-                    })) {
-                        ForEach(CredentialStorageMode.allCases) { Text($0.displayName).tag($0) }
-                    }.disabled(!editsAllowed)
-                    Text((storageMode == .keychain
-                         ? "Encrypted by macOS Keychain. App updates may ask for access again."
-                         : "Unencrypted files readable by apps running as your macOS account. No Keychain prompts after updates.")
-                         + " Changing storage does not move existing keys.")
+                    Text(storageNote)
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     if !editsAllowed {
@@ -113,9 +109,7 @@ struct AccountSettingsView: View {
                     Text("Use API keys from each provider's developer console. Consumer subscriptions do not include API usage.")
                         .font(.caption).foregroundStyle(.secondary)
                 } header: { Text("API keys") }
-                if ProviderRegistry.azureAvailable { AzureEndpointSection(editsAllowed: editsAllowed) }
                 UsageSection()
-                TranslationServerSection(editsAllowed: editsAllowed)
                 Section {
                     Button("Remove all saved keys…", role: .destructive) {
                         guard editsAllowed else { return }
@@ -138,65 +132,6 @@ struct AccountSettingsView: View {
                     Text("Remove all service keys from \(state.removalStorage?.displayName ?? storageMode.displayName)? Keys in the other storage location will remain.")
                 }
         }
-    }
-}
-
-struct TroubleshootingSettingsView: View {
-    @ObservedObject var conversation: ConversationModel
-    private var model: AppModel { conversation.selected }
-    var body: some View {
-        VStack(spacing: 0) {
-            SettingsHeading(title: "Troubleshooting", detail: "Check a connection or copy session details when something does not work.")
-            Form {
-                Section {
-                    Picker("Direction", selection: $conversation.direction) {
-                        Text("Speak").tag(ConversationDirection.outgoing)
-                        Text("Listen").tag(ConversationDirection.incoming)
-                    }.pickerStyle(.segmented).labelsHidden()
-                }
-                Section {
-                    HStack {
-                        Button(model.checkingAPI ? "Checking connection…" : "Check OpenAI direct connection") {
-                            Task { await model.testAPIConnection() }
-                        }.disabled(conversation.locked)
-                        if model.checkingAPI { ProgressView().controlSize(.small) }
-                    }
-                    Text("Sends one second of generated silence. Your microphone is not used.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Text(model.keyNotice).font(.callout).foregroundStyle(.secondary)
-                } header: { Text("Connection") }
-                Section {
-                    ScrollView {
-                        Text(model.logs.isEmpty ? "No session details yet." : model.logs.joined(separator: "\n"))
-                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }.frame(height: 160)
-                    HStack {
-                        Text("Audio, API keys and transcripts are excluded.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Clear") { model.clearDiagnostics() }.disabled(model.logs.isEmpty)
-                            .accessibilityLabel("Clear diagnostic details")
-                    }
-                } header: { Text("Session details") }
-                Section {
-                    Button("Setup and routing help") { AppLinks.openHelp() }
-                }
-            }.formStyle(.grouped)
-        }
-    }
-}
-
-struct SettingsHeading: View {
-    var title: String
-    var detail: String
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(.title2.weight(.semibold))
-            Text(detail).font(.callout).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 24).padding(.top, 24).padding(.bottom, 4)
     }
 }
 

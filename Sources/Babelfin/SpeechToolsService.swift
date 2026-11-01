@@ -25,6 +25,8 @@ extension SpeechToolsTranscriber {
     private let translator: any TextTranslationStage
     private let elevenSynthesis: any SpeechSynthesisStage
     private let fishSynthesis: any SpeechSynthesisStage
+    private let systemSynthesis: any SpeechSynthesisStage
+    private let geminiSynthesis: any SpeechSynthesisStage
     private let voiceChanger: ElevenLabsVoiceChanger
     private let operationTimeout: TimeInterval
     private var operation: ProviderCancellation?
@@ -33,12 +35,15 @@ extension SpeechToolsTranscriber {
     init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport(),
          transcriber: (any SpeechToolsTranscriber)? = nil, translator: (any TextTranslationStage)? = nil,
          elevenSynthesis: (any SpeechSynthesisStage)? = nil, fishSynthesis: (any SpeechSynthesisStage)? = nil,
+         systemSynthesis: (any SpeechSynthesisStage)? = nil, geminiSynthesis: (any SpeechSynthesisStage)? = nil,
          operationTimeout: TimeInterval = 600) {
         self.transport = transport
         self.transcriber = transcriber ?? ElevenLabsRecordingTranscriber(transport: transport)
         self.translator = translator ?? OpenAITextTranslationStage(transport: transport)
         self.elevenSynthesis = elevenSynthesis ?? ElevenLabsSpeechSynthesisStage(transport: transport)
         self.fishSynthesis = fishSynthesis ?? FishSpeechSynthesisStage(transport: transport)
+        self.systemSynthesis = systemSynthesis ?? AppleSpeechSynthesisStage()
+        self.geminiSynthesis = geminiSynthesis ?? GeminiSpeechSynthesisStage(transport: transport)
         self.voiceChanger = ElevenLabsVoiceChanger(transport: transport)
         self.operationTimeout = operationTimeout.isFinite ? min(600, max(0.01, operationTimeout)) : 600
     }
@@ -122,14 +127,11 @@ extension SpeechToolsTranscriber {
                    direction: SpeechDirection = .standard, credentials: ProviderCredentials) async throws -> Data {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SpeechToolsError.emptyText }
         guard text.count <= SpeechToolsLimits.voiceCharacters, text.utf8.count <= 8_000 else { throw SpeechToolsError.clipTooLong }
-        guard route.descriptor.speechService != nil else { throw SpeechToolsError.unsupportedVoiceProvider }
         try validateProviderToken(language)
-        if route == .elevenLabs, voiceID == nil { throw BridgeError.unavailable("Choose an ElevenLabs voice in Settings.") }
-        _ = try credentials.require(route == .elevenLabs ? .elevenLabs : .fish)
+        let stage = try synthesisStage(for: route, voiceID: voiceID, credentials: credentials)
         return try await perform { token in
             self.onProgress?(.init(stage: .voiceClip, completed: 0, total: 1)); try token.check()
             let audio = SpeechToolsBuffer(maximumBytes: SpeechToolsLimits.voicePCMBytes)
-            let stage = route == .elevenLabs ? self.elevenSynthesis : self.fishSynthesis
             try await stage.synthesize(text: text, language: language, voiceID: voiceID, direction: direction, credentials: credentials) { bytes in
                 try token.check(); try Task.checkCancellation(); try audio.append(bytes)
             }
@@ -152,12 +154,9 @@ extension SpeechToolsTranscriber {
         guard !segments.isEmpty else { throw SpeechToolsError.emptyText }
         guard segments.allSatisfy({ $0.startSeconds != nil }) else { throw SpeechToolsError.dubUntimed }
         guard (segments.compactMap(\.endSeconds).max() ?? 0) <= SpeechToolsLimits.dubSeconds else { throw SpeechToolsError.dubTooLong }
-        guard route.descriptor.speechService != nil else { throw SpeechToolsError.unsupportedVoiceProvider }
-        if route == .elevenLabs, voiceID == nil { throw BridgeError.unavailable("Choose an ElevenLabs voice in Settings.") }
-        _ = try credentials.require(route == .elevenLabs ? .elevenLabs : .fish)
+        let stage = try synthesisStage(for: route, voiceID: voiceID, credentials: credentials)
         let ordered = segments.sorted { ($0.startSeconds ?? 0) < ($1.startSeconds ?? 0) }
         return try await perform { token in
-            let stage = route == .elevenLabs ? self.elevenSynthesis : self.fishSynthesis
             var passages: [Data] = []
             self.onProgress?(.init(stage: .dub, completed: 0, total: ordered.count))
             for segment in ordered {
@@ -199,7 +198,19 @@ extension SpeechToolsTranscriber {
     func cancel() {
         guard operation != nil else { return }
         operation?.cancel(); transport.cancel(); transcriber.cancel(); translator.cancel()
-        elevenSynthesis.cancel(); fishSynthesis.cancel(); voiceChanger.cancel()
+        elevenSynthesis.cancel(); fishSynthesis.cancel(); systemSynthesis.cancel(); geminiSynthesis.cancel(); voiceChanger.cancel()
+    }
+
+    /// The speech stage for a voice tool. ElevenLabs, Fish and Gemini need their key; ElevenLabs also
+    /// needs a voice. On this Mac uses the system voices and sends nothing.
+    private func synthesisStage(for route: TranslationRoute, voiceID: String?,
+                                credentials: ProviderCredentials) throws -> any SpeechSynthesisStage {
+        if route == .appleLocal { return systemSynthesis }
+        if route == .fish { _ = try credentials.require(.fish); return fishSynthesis }
+        if route == .gemini { _ = try credentials.require(.gemini); return geminiSynthesis }
+        guard route == .elevenLabs else { throw SpeechToolsError.unsupportedVoiceProvider }
+        guard voiceID != nil else { throw BridgeError.unavailable("Choose an ElevenLabs voice in Settings.") }
+        _ = try credentials.require(.elevenLabs); return elevenSynthesis
     }
 
     private func perform<Value: Sendable>(_ body: @MainActor (ProviderCancellation) async throws -> Value) async throws -> Value {

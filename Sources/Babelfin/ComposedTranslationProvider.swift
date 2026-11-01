@@ -221,6 +221,10 @@ private final class PreparedSpeech: @unchecked Sendable {
     private struct Job { let segment: TranscriptSegment; let arrived: TimeInterval; let stamps = StageStamps() }
     private var jobs: [Job] = []
     private var inFlight: Job?
+    /// The synthesis prepared ahead for the segment being spoken, so Stop can cancel it.
+    private var activePreparation: (task: Task<Void, Never>, speech: PreparedSpeech)?
+    /// Passages in a row whose synthesis returned no audio; three fail the session.
+    private var emptySyntheses = 0
     /// The next segment is translated and synthesized while the current segment is spoken, so
     /// translation and synthesis latency overlap playback instead of adding a gap per segment.
     private var lookahead: (job: Job, translation: Task<String, Error>, speech: PreparedSpeech, preparation: Task<Void, Never>)?
@@ -239,9 +243,11 @@ private final class PreparedSpeech: @unchecked Sendable {
     }
     /// The voice, the output language and Delay apply from the next passage; the route, the input
     /// language and Speak the translation need a new session.
+    /// Speaker voices change live; turning them on or off changes recognition and needs a new session.
     func applyLive(_ next: TranslationConfiguration) -> Bool {
         guard state == .running, next.route == configuration.route, next.sourceLanguage == configuration.sourceLanguage,
               next.speaksTranslation == configuration.speaksTranslation,
+              next.speakerVoices.isEmpty == configuration.speakerVoices.isEmpty,
               (try? ProviderCapabilities.forRoute(next.route).validate(next)) != nil else { return false }
         if next.pacing != configuration.pacing {
             policy.targetLag = next.pacing.targetLagSeconds
@@ -276,7 +282,8 @@ private final class PreparedSpeech: @unchecked Sendable {
                 while !Task.isCancelled {
                     do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
                     guard let self, self.generation == token else { return }
-                    if !self.speaking, let stuck = self.inFlight?.arrived, self.now() - stuck > self.policy.maximumAge {
+                    // Measured from the translation start: a segment that waited in the queue is not stuck.
+                    if !self.speaking, let job = self.inFlight, self.now() - (job.stamps.value("translate") ?? job.arrived) > self.policy.maximumAge {
                         await self.fail("translation_backlog_stale", token: token)
                         return
                     }
@@ -333,7 +340,7 @@ private final class PreparedSpeech: @unchecked Sendable {
         guard speaking, lookahead == nil, !jobs.isEmpty else { return }
         let next = jobs.removeFirst()
         let pending = translation(for: next), speech = PreparedSpeech()
-        let request = configuration, keys = credentials, stamps = next.stamps
+        let request = configuration, keys = credentials, stamps = next.stamps, voice = request.voice(forSpeaker: next.segment.speaker)
         // Cancelling this task cancels the synthesis request, so a skipped segment frees its slot.
         let preparation = Task { @MainActor [synthesizer, gate, policy, now] in
             do {
@@ -341,7 +348,7 @@ private final class PreparedSpeech: @unchecked Sendable {
                 guard !gate.outputDetached, request.speaksTranslation, !Task.isCancelled else { speech.finish(CancellationError()); return }
                 stamps.mark("voice", now())
                 try await CompositionDeadline<Void>().run(seconds: policy.stageTimeout) {
-                    try await synthesizer.synthesize(text: text, language: request.targetLanguage, voiceID: request.voiceID,
+                    try await synthesizer.synthesize(text: text, language: request.targetLanguage, voiceID: voice,
                                                     credentials: keys, onAudio: { pcm in stamps.mark("voiced", now()); speech.append(pcm) })
                 }
                 speech.finish()
@@ -367,7 +374,10 @@ private final class PreparedSpeech: @unchecked Sendable {
             let job: Job, pending: Task<String, Error>, prepared: PreparedSpeech?
             await catchUp(token: token)
             guard generation == token else { return }
-            if let ahead = lookahead { job = ahead.job; pending = ahead.translation; prepared = ahead.speech; lookahead = nil }
+            if let ahead = lookahead {
+                job = ahead.job; pending = ahead.translation; prepared = ahead.speech; lookahead = nil
+                activePreparation = (ahead.preparation, ahead.speech)
+            }
             else {
                 guard !jobs.isEmpty else { break }
                 job = jobs.removeFirst()
@@ -379,6 +389,8 @@ private final class PreparedSpeech: @unchecked Sendable {
             let request = configuration
             let keys = credentials
             var synthesizing = false
+            let delivered = DeliveredBytes()
+            defer { activePreparation = nil }
             do {
                 let text = try await withTaskCancellationHandler { try await pending.value } onCancel: { pending.cancel() }
                 guard generation == token, !Task.isCancelled else { return }
@@ -396,7 +408,6 @@ private final class PreparedSpeech: @unchecked Sendable {
                     let lag = now() - job.arrived
                     let rate = policy.speakingRate(lag: lag, previous: lastRate, waiting: waiting.oldest != nil)
                     let stretcher = SpeechRateStretcher()
-                    let delivered = DeliveredBytes()
                     let pace = LiveRate(rate)
                     // While audio plays, a waiting segment's age drives the rate in small steps.
                     let adjust: @Sendable () -> Void = { [waiting, policy, now] in
@@ -423,7 +434,7 @@ private final class PreparedSpeech: @unchecked Sendable {
                         synthesisDeadline = deadline
                         stamps.mark("voice", now())
                         try await deadline.run(seconds: policy.stageTimeout) { [synthesizer, gate] in
-                            try await synthesizer.synthesize(text: text, language: request.targetLanguage, voiceID: request.voiceID,
+                            try await synthesizer.synthesize(text: text, language: request.targetLanguage, voiceID: request.voice(forSpeaker: source.speaker),
                                                             credentials: keys, onAudio: { pcm in
                                 stamps.mark("voiced", now())
                                 adjust()
@@ -446,10 +457,18 @@ private final class PreparedSpeech: @unchecked Sendable {
                     }
                 }
                 guard generation == token, !Task.isCancelled else { return }
-                queuedCharacters -= source.text.count; inFlight = nil
+                queuedCharacters -= source.text.count; inFlight = nil; emptySyntheses = 0
             } catch {
                 synthesisDeadline = nil
                 guard generation == token else { return }
+                // A passage whose speech came back empty is skipped, unless it keeps happening.
+                if synthesizing, delivered.total == 0, !gate.outputDetached, !gate.failedPlayback,
+                   case .invalidResponse = TranslationFailureReason(error: error), emptySyntheses < 2 {
+                    emptySyntheses += 1
+                    await onEvent?(.notice("Skipped one passage: the speech service returned no audio for it."))
+                    queuedCharacters -= source.text.count; inFlight = nil
+                    continue
+                }
                 if synthesizing, gate.outputDetached, !gate.failedPlayback {
                     // Deliberate text-only completion cancels speech, not queued translation jobs.
                     queuedCharacters -= source.text.count; inFlight = nil
@@ -492,9 +511,10 @@ private final class PreparedSpeech: @unchecked Sendable {
         gate.closeInput()
         onAudio = nil
         recognizer.stopInput()
-        if synthesisDeadline != nil || lookahead != nil {
+        if synthesisDeadline != nil || lookahead != nil || activePreparation != nil {
             synthesisDeadline?.cancel()
             lookahead?.preparation.cancel(); lookahead?.speech.finish(CancellationError())
+            activePreparation?.task.cancel(); activePreparation?.speech.finish(CancellationError())
             synthesizer.cancel()
         }
     }
@@ -529,6 +549,7 @@ private final class PreparedSpeech: @unchecked Sendable {
         recognizer.cancel(); translator.cancel(); synthesizer.cancel()
         consumer?.cancel(); consumer = nil; monitor?.cancel(); monitor = nil
         lookahead?.translation.cancel(); lookahead?.preparation.cancel(); lookahead?.speech.finish(CancellationError()); lookahead = nil
+        activePreparation?.task.cancel(); activePreparation?.speech.finish(CancellationError()); activePreparation = nil
         jobs.removeAll(); inFlight = nil; queuedCharacters = 0; waiting.set(nil)
         credentials = ProviderCredentials(); state = .cancelled
     }

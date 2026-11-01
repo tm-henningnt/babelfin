@@ -20,13 +20,16 @@ public struct StageDescriptor: Sendable, Identifiable, Equatable {
     public let acceptsLanguageHint: Bool
     /// A synthesis stage applies a speaking rate itself.
     public let nativeSpeakingRate: Bool
+    /// A recognition stage labels speakers live.
+    public let liveSpeakerLabels: Bool
     public init(id: String, kind: Kind, service: ProviderService?, displayName: String, modelID: String,
                 inputLanguages: [TranslationLanguage]?, outputLanguages: [TranslationLanguage]?,
-                detectsLanguage: Bool = false, acceptsLanguageHint: Bool = false, nativeSpeakingRate: Bool = false) {
+                detectsLanguage: Bool = false, acceptsLanguageHint: Bool = false, nativeSpeakingRate: Bool = false,
+                liveSpeakerLabels: Bool = false) {
         self.id = id; self.kind = kind; self.service = service; self.displayName = displayName; self.modelID = modelID
         self.inputLanguages = inputLanguages; self.outputLanguages = outputLanguages
         self.detectsLanguage = detectsLanguage; self.acceptsLanguageHint = acceptsLanguageHint
-        self.nativeSpeakingRate = nativeSpeakingRate
+        self.nativeSpeakingRate = nativeSpeakingRate; self.liveSpeakerLabels = liveSpeakerLabels
     }
 }
 
@@ -54,6 +57,8 @@ public struct RouteDescriptor: Sendable, Identifiable, Equatable {
     }
     public var acceptsLanguageHint: Bool { stages[0].acceptsLanguageHint }
     public var nativeSpeakingRate: Bool { stages.last?.nativeSpeakingRate ?? false }
+    /// The route can label speakers and give each one a voice.
+    public var liveSpeakerLabels: Bool { !isDirect && stages[0].liveSpeakerLabels && stages.last?.service != nil }
     /// The account whose voices the route speaks with. Nil for a direct route.
     public var speechService: ProviderService? { isDirect ? nil : stages.last?.service }
 }
@@ -68,6 +73,16 @@ public enum ProviderRegistry {
         id: "elevenlabs-scribe-realtime", kind: .recognition, service: .elevenLabs, displayName: "ElevenLabs Scribe",
         modelID: "scribe_v2_realtime", inputLanguages: TranslationLanguage.elevenLabsOutputs, outputLanguages: nil,
         detectsLanguage: true, acceptsLanguageHint: true)
+    /// OpenAI live transcription. It has no server turn detection, so the recognizer commits each passage.
+    public static let openAILiveTranscribe = StageDescriptor(
+        id: "openai-live-transcribe", kind: .recognition, service: .openAI, displayName: "OpenAI live transcription",
+        modelID: "gpt-live-transcribe", inputLanguages: TranslationLanguage.openAILiveTranscribeInputs, outputLanguages: nil,
+        detectsLanguage: true, acceptsLanguageHint: true)
+    /// Fish Audio realtime recognition. Fish detects the language; it has no language hint.
+    public static let fishLiveTranscribe = StageDescriptor(
+        id: "fish-asr-realtime", kind: .recognition, service: .fish, displayName: "Fish Audio recognition",
+        modelID: "transcribe-stream-1", inputLanguages: TranslationLanguage.fishRecognitionInputs, outputLanguages: nil,
+        detectsLanguage: true, acceptsLanguageHint: true, liveSpeakerLabels: true)
     public static let openAIText = StageDescriptor(
         id: "openai-text", kind: .translation, service: .openAI, displayName: "OpenAI text translation",
         modelID: "gpt-5.6-luna", inputLanguages: nil, outputLanguages: nil)
@@ -98,9 +113,43 @@ public enum ProviderRegistry {
         id: "server-text", kind: .translation, service: nil, displayName: "your translation server",
         modelID: "server model", inputLanguages: nil, outputLanguages: nil)
 
+    /// Languages of Apple's on-device frameworks on this Mac. The app loads them at launch on
+    /// macOS 26 and later; nil keeps the on-device route hidden.
+    public struct LocalLanguages: Sendable, Equatable {
+        public let recognition: [TranslationLanguage]
+        public let translation: [TranslationLanguage]
+        public let speech: [TranslationLanguage]
+        public init(recognition: [TranslationLanguage], translation: [TranslationLanguage], speech: [TranslationLanguage]) {
+            self.recognition = recognition; self.translation = translation; self.speech = speech
+        }
+    }
+    public static var localLanguages: LocalLanguages? {
+        get { state.localLanguages }
+        set { state.localLanguages = newValue }
+    }
+    /// On-device stages need no account. Recognition needs a chosen input language.
+    public static var appleRecognition: StageDescriptor {
+        StageDescriptor(id: "apple-speech-recognition", kind: .recognition, service: nil, displayName: "Apple speech recognition",
+                        modelID: "SpeechAnalyzer", inputLanguages: localLanguages?.recognition ?? [], outputLanguages: nil,
+                        acceptsLanguageHint: true)
+    }
+    public static var appleTranslation: StageDescriptor {
+        StageDescriptor(id: "apple-translation", kind: .translation, service: nil, displayName: "Apple Translation",
+                        modelID: "Translation", inputLanguages: nil, outputLanguages: localLanguages?.translation ?? [])
+    }
+    public static var appleSpeech: StageDescriptor {
+        StageDescriptor(id: "apple-speech-voices", kind: .synthesis, service: nil, displayName: "a system voice",
+                        modelID: "AVSpeechSynthesizer", inputLanguages: nil, outputLanguages: localLanguages?.speech ?? [],
+                        nativeSpeakingRate: true)
+    }
+    private static var localRoute: RouteDescriptor {
+        try! RouteDescriptor(id: "apple-local", displayName: "On this Mac", stages: [appleRecognition, appleTranslation, appleSpeech])
+    }
+
     public static var stages: [StageDescriptor] {
         [openAIRealtime, geminiLive, palabraLive] + (azureAvailable ? [azureInterpreter] : [])
-            + [elevenLabsScribe, openAIText, elevenLabsSpeech, fishSpeech] + (translationServerAvailable ? [serverText] : [])
+            + [elevenLabsScribe, openAILiveTranscribe, fishLiveTranscribe, openAIText, elevenLabsSpeech, fishSpeech] + (translationServerAvailable ? [serverText] : [])
+            + (localLanguages != nil ? [appleRecognition, appleTranslation, appleSpeech] : [])
     }
 
     private static let state = RegistryState()
@@ -118,6 +167,7 @@ public enum ProviderRegistry {
 
     public static var routes: [RouteDescriptor] {
         builtInRoutes + (azureAvailable ? [azureRoute] : []) + (translationServerAvailable ? serverRoutes : [])
+            + (localLanguages != nil ? [localRoute] : [])
     }
     private static let azureRoute = try! RouteDescriptor(id: "azure", displayName: "Azure Live Interpreter", stages: [azureInterpreter])
 
@@ -137,17 +187,27 @@ public enum ProviderRegistry {
                              stages: [elevenLabsScribe, openAIText, elevenLabsSpeech]),
         try! RouteDescriptor(id: TranslationRoute.fish.rawValue, displayName: "Fish Audio",
                              stages: [elevenLabsScribe, openAIText, fishSpeech]),
+        // OpenAI recognition: the Fish Audio route then needs no ElevenLabs account.
+        try! RouteDescriptor(id: "fish-openai", displayName: "Fish Audio with OpenAI recognition",
+                             stages: [openAILiveTranscribe, openAIText, fishSpeech]),
+        try! RouteDescriptor(id: "elevenlabs-openai", displayName: "ElevenLabs with OpenAI recognition",
+                             stages: [openAILiveTranscribe, openAIText, elevenLabsSpeech]),
+        // Fish recognition for the languages Fish documents; Norwegian is not among them.
+        try! RouteDescriptor(id: "fish-fish", displayName: "Fish Audio with Fish recognition",
+                             stages: [fishLiveTranscribe, openAIText, fishSpeech]),
     ]
 
     /// Looks up every route the app defines, offered or not, so a route that stops being
     /// offered (a removed server) still describes itself until the user chooses another.
     public static func route(_ route: TranslationRoute) -> RouteDescriptor {
-        (builtInRoutes + [azureRoute] + serverRoutes).first { $0.id == route.rawValue }!
+        (builtInRoutes + [azureRoute] + serverRoutes + [localRoute]).first { $0.id == route.rawValue }!
     }
 }
 
 private final class RegistryState: @unchecked Sendable {
     private let lock = NSLock(); private var available = false, azure = false
+    private var local: ProviderRegistry.LocalLanguages?
+    var localLanguages: ProviderRegistry.LocalLanguages? { get { lock.withLock { local } } set { lock.withLock { local = newValue } } }
     var serverAvailable: Bool { get { lock.withLock { available } } set { lock.withLock { available = newValue } } }
     var azureAvailable: Bool { get { lock.withLock { azure } } set { lock.withLock { azure = newValue } } }
 }

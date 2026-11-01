@@ -9,9 +9,12 @@ enum VoiceProvider: String, CaseIterable, Identifiable, Sendable {
 struct ProviderVoice: Identifiable, Equatable, Sendable {
     let id: String
     let name: String
-    let provider: VoiceProvider
+    /// Nil for a system voice on this Mac.
+    let provider: VoiceProvider?
     let state: String
     let isReady: Bool
+    /// The Babelfin language code of a system voice. Account voices can speak many languages.
+    var language: String? = nil
 }
 
 /// This service never loads credentials itself and never enrolls a voice implicitly.

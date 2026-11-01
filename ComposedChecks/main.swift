@@ -56,9 +56,12 @@ private func expect(_ condition: @autoclosure () -> Bool, _ message: String) thr
 }
 @MainActor private final class Synthesizer: SpeechSynthesisStage {
     var calls: [String] = []
+    var voices: [String?] = []
     var cancels = 0
     var wrapsSinkErrors = false
     var blocked = false
+    /// Texts that come back with no audio, as a service can do for a passage of symbols.
+    var silentFor: Set<String> = []
     /// Blocked calls in arrival order. Speech for the next segment can be prepared while the
     /// current one is blocked, so more than one call can wait.
     var waiters: [CheckedContinuation<Void, Error>] = []
@@ -68,8 +71,9 @@ private func expect(_ condition: @autoclosure () -> Bool, _ message: String) thr
     }
     func synthesize(text: String, language: String, voiceID: String?, credentials: ProviderCredentials,
                     onAudio: @escaping TranslationAudioHandler) async throws {
-        calls.append(text)
+        calls.append(text); voices.append(voiceID)
         if blocked { try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in waiters.append(continuation) } }
+        if silentFor.contains(text) { throw BridgeError.invalidEvent }
         // Data slices can have nonzero indices; the canonical audio seam must handle them.
         let pcm = PCM16.encode([Float](repeating: 0.25, count: 3001))
         do { try await onAudio(pcm.dropFirst(2)) }
@@ -138,7 +142,35 @@ private final class Clock: @unchecked Sendable {
             catch is CheckFailure { throw CheckFailure(message: "OpenAI ignored unsupported selected voice") }
             catch {}
             try expect(!TranslationWire.supportedTargets.contains("no") && ProviderCapabilities.forRoute(.elevenLabs).outputLanguages.contains { $0.code == "no" }, "Route language coverage conflated")
+            let config = TranslationConfiguration(route: .elevenLabs, voiceID: "main", speakerVoices: ["anna", "bo"])
+            try expect(config.voice(forSpeaker: "1") == "anna" && config.voice(forSpeaker: "2") == "bo" && config.voice(forSpeaker: "3") == "anna"
+                       && config.voice(forSpeaker: nil) == "main" && TranslationConfiguration(voiceID: "main").voice(forSpeaker: "2") == "main"
+                       && TranslationConfiguration(speakerVoices: Array(repeating: "v", count: 12)).speakerVoices.count == 8,
+                       "Speaker voices go in order and repeat; unlabeled lines use the main voice; at most 8")
+            let voiced = Fixture()
+            try await voiced.provider.start(configuration: .init(targetLanguage: "no", route: .elevenLabs, voiceID: "main", speakerVoices: ["anna", "bo"]),
+                                            credentials: .init(openAI: "fixture-openai", elevenLabs: "fixture-eleven"))
+            await voiced.recognizer.emit(.init(id: "p1", text: "One.", isFinal: true, language: "en", speaker: "2"))
+            await voiced.recognizer.emit(.init(id: "p2", text: "Two.", isFinal: true, language: "en"))
+            try await until { voiced.synthesizer.voices.count == 2 }
+            try expect(voiced.synthesizer.voices == ["bo", "main"], "Each passage is spoken with its speaker's voice: \(voiced.synthesizer.voices)")
+            voiced.provider.cancel()
+            let emptyAudio = Fixture(); try await emptyAudio.start()
+            emptyAudio.synthesizer.silentFor = ["translated: ..."]
+            await emptyAudio.recognizer.emit(.init(id: "s1", text: "...", isFinal: true, language: "en"))
+            await emptyAudio.recognizer.emit(.init(id: "s2", text: "Real words.", isFinal: true, language: "en"))
+            try await until { emptyAudio.synthesizer.calls.count == 2 && !emptyAudio.bytes.packets.isEmpty }
+            try expect(emptyAudio.events.failures.isEmpty && emptyAudio.events.notices.contains { $0.contains("returned no audio") },
+                       "A passage with no audio is skipped with a notice; the session continues: \(emptyAudio.events.failures)")
+            emptyAudio.provider.cancel()
+            let alwaysSilent = Fixture(); try await alwaysSilent.start()
+            alwaysSilent.synthesizer.silentFor = ["translated: a", "translated: b", "translated: c"]
+            for (index, text) in ["a", "b", "c"].enumerated() { await alwaysSilent.recognizer.emit(.init(id: "q\(index)", text: text, isFinal: true, language: "en")) }
+            try await until { alwaysSilent.events.failures.contains { $0.hasPrefix("speech_synthesis_failed") } }
+            alwaysSilent.provider.cancel()
             let live = Fixture(); try await live.start()
+            let withSpeakers = TranslationConfiguration(targetLanguage: "no", route: .elevenLabs, voiceID: "fixture-voice", speakerVoices: ["a"])
+            try expect(!live.provider.applyLive(withSpeakers), "Turning speaker voices on needs a new session")
             let faster = TranslationConfiguration(targetLanguage: "no", route: .elevenLabs, voiceID: "fixture-voice", pacing: .fast)
             try expect(live.provider.applyLive(faster) && live.recognizer.pacings == [.fast], "Delay applies to a running session without a restart")
             try expect(live.provider.applyLive(faster) && live.recognizer.pacings == [.fast], "An unchanged Delay is not sent again")
@@ -182,6 +214,13 @@ private final class Clock: @unchecked Sendable {
             try expect(timing?.passageSeconds == 1 && timing?.translateSeconds != nil && timing?.voiceSeconds != nil
                        && timing.map { $0.totalSeconds >= ($0.translateSeconds ?? 0) && $0.waitSeconds >= 0 } == true,
                        "Passage timing must report the passage length and each stage: \(String(describing: timing))")
+            let parts = PassageTiming(passageSeconds: 2, translateSeconds: 0.4, voiceSeconds: 0.3, preparedAhead: false,
+                                      totalSeconds: 1.2, speechSeconds: 3, rate: 1).stages
+            let ahead = PassageTiming(passageSeconds: 2, translateSeconds: 0.4, voiceSeconds: 0.3, preparedAhead: true,
+                                      totalSeconds: 0.2, speechSeconds: 3, rate: 1).stages
+            try expect(parts.map(\.stage) == [.translation, .voice, .waiting] && abs(parts.map(\.seconds).reduce(0, +) - 1.2) < 1e-9
+                       && ahead.map(\.stage) == [.waiting] && ahead[0].seconds == 0.2,
+                       "Timing stages add up to the total; a passage prepared ahead only waited")
             revisions.provider.cancel()
             passed += 1; print("PASS: Only committed source is spoken once; revisions and timing remain visible")
 

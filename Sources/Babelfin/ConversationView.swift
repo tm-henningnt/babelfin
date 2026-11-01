@@ -1,129 +1,208 @@
 import SwiftUI
 import BridgeCore
 
+/// The main window. Compact controls are a separate window (see `CompactWindow`).
 struct ConversationView: View {
     @ObservedObject var conversation: ConversationModel
     @Environment(\.openWindow) private var openWindow
-    @AppStorage("babelfin.compactControls.v1") private var compact = true
-    // Compact rows show their own Set up… action, so setup gaps never block compact mode.
-    private var showCompact: Bool { compact }
     var body: some View {
-        Group {
-            if showCompact {
-                CompactControlsView(conversation: conversation) { compact = false }
-            } else {
-                MainWindowView(conversation: conversation) { compact = true }
+        MainWindowView(conversation: conversation) { MainNavigation.openCompact(openWindow: openWindow) }
+            .frame(minWidth: ConversationWindowSizing.expandedMinimum.width, minHeight: ConversationWindowSizing.expandedMinimum.height)
+            .background(ConversationWindowSizing(compact: false))
+            .onAppear {
+                // At first launch, open the setup assistant. Later, open compact controls instead
+                // when the user chose them in Settings › General.
+                if MainNavigation.launching && FirstRunPreferences.shouldShow {
+                    openWindow(id: "welcome")
+                } else if MainNavigation.launching, UserDefaults.standard.object(forKey: CompactPreferences.atLaunch) as? Bool ?? true {
+                    MainNavigation.openCompact(openWindow: openWindow)
+                }
+                MainNavigation.launching = false
             }
-        }
-        .frame(minWidth: showCompact ? ConversationWindowSizing.compactMinimum.width : ConversationWindowSizing.expandedMinimum.width,
-               minHeight: showCompact ? ConversationWindowSizing.compactMinimum.height : ConversationWindowSizing.expandedMinimum.height)
-        .background(ConversationWindowSizing(compact: showCompact))
     }
 }
 
+/// Settings: five tabs. The live controls are on Home; Settings holds what changes rarely.
 struct ConversationSettingsView: View {
     @ObservedObject var conversation: ConversationModel
     @StateObject private var navigation: SettingsNavigationState
     init(conversation: ConversationModel, initialDestination: SettingsDestination? = nil) {
         self.conversation = conversation
-        _navigation = StateObject(wrappedValue: SettingsNavigationState(selection: initialDestination ?? SettingsRequest.destination ?? (conversation.direction == .outgoing ? .outgoing : .incoming)))
+        _navigation = StateObject(wrappedValue: SettingsNavigationState(selection: initialDestination ?? SettingsRequest.destination ?? .general))
     }
     var body: some View {
-        HStack(spacing: 0) {
-            List(selection: $navigation.selection) {
-                Section("Translation") {
-                    Label("Language setup", systemImage: "wand.and.stars").tag(SettingsDestination.setup)
-                    Label("Speak", systemImage: "mic").tag(SettingsDestination.outgoing)
-                    Label("Listen", systemImage: "headphones").tag(SettingsDestination.incoming)
-                }
-                Section {
-                    Label("Accounts", systemImage: "key").tag(SettingsDestination.accounts)
-                    if AudioDriverInstaller.bundlesDrivers() {
-                        Label("Audio devices", systemImage: "hifispeaker.2").tag(SettingsDestination.audioDevices)
-                    }
-                    Label("Troubleshooting", systemImage: "wrench.and.screwdriver").tag(SettingsDestination.troubleshooting)
-                }
-            }.listStyle(.sidebar).frame(width: 190)
-                .accessibilityLabel("Settings categories")
-            Divider()
-            Group {
-                switch navigation.selection ?? .outgoing {
-                case .outgoing, .incoming:
-                    let direction: ConversationDirection = navigation.selection == .incoming ? .incoming : .outgoing
-                    SettingsView(model: direction == .outgoing ? conversation.outgoing : conversation.incoming,
-                        direction: direction, allAudioStopped: { !conversation.locked }, openAccounts: { navigation.selection = .accounts })
-                        .id(direction)
-                case .setup:
-                    SetupWizardView(conversation: conversation, openAccounts: { navigation.selection = .accounts })
-                case .accounts:
-                    AccountSettingsView(allAudioStopped: { !conversation.locked })
-                case .audioDevices:
-                    AudioDriverSettingsView(conversation: conversation)
-                case .troubleshooting:
-                    TroubleshootingSettingsView(conversation: conversation)
-                }
-            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        TabView(selection: Binding(get: { navigation.selection.tab }, set: { navigation.selection = $0 })) {
+            GeneralSettingsView(conversation: conversation)
+                .tabItem { Label("General", systemImage: "gearshape") }.tag(SettingsDestination.general)
+            AccountSettingsView(allAudioStopped: { !conversation.locked })
+                .tabItem { Label("Accounts", systemImage: "key") }.tag(SettingsDestination.accounts)
+            DeviceSettingsView(conversation: conversation)
+                .tabItem { Label("Audio devices", systemImage: "hifispeaker.2") }.tag(SettingsDestination.audioDevices)
+            LanguageSettingsView(conversation: conversation, page: $navigation.languagePage,
+                                 openAccounts: { navigation.selection = .accounts })
+                .tabItem { Label("Languages and services", systemImage: "globe") }.tag(SettingsDestination.languages)
+            AdvancedSettingsView(conversation: conversation)
+                .tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }.tag(SettingsDestination.advanced)
         }
-        .frame(width: 780, height: 740)
+        .frame(width: 780, height: 700)
+        .onAppear { navigation.apply(navigation.selection) }
         .onReceive(NotificationCenter.default.publisher(for: .babelfinSettingsDestination)) { notification in
-            if let destination = notification.object as? SettingsDestination { navigation.selection = destination }
+            if let destination = notification.object as? SettingsDestination { navigation.apply(destination) }
         }
-
     }
 }
 
+/// A Settings tab, or a page inside Languages and services.
 enum SettingsDestination: Hashable {
-    case setup, outgoing, incoming, accounts, audioDevices, troubleshooting
+    case general, accounts, audioDevices, languages, advanced
+    /// Languages and services, at one direction's details.
+    case outgoing, incoming
+    var tab: SettingsDestination {
+        switch self {
+        case .outgoing, .incoming: return .languages
+        default: return self
+        }
+    }
 }
 
 @MainActor private final class SettingsNavigationState: ObservableObject {
-    @Published var selection: SettingsDestination?
-    init(selection: SettingsDestination) { self.selection = selection }
-}
-
-/// Menu-bar menu: one group per direction with its state and next actions.
-struct ConversationMenu: View {
-    @ObservedObject var conversation: ConversationModel
-    var body: some View {
-        StatusDirectionItems(model: conversation.outgoing, title: "Speak")
-        Divider()
-        StatusDirectionItems(model: conversation.incoming, title: "Listen")
-        Divider()
-        SectionButton(section: conversation.direction == .outgoing ? .outgoing : .incoming, title: "Open Babelfin")
-        SectionButton(section: .transcript)
-        SubtitleToggleButton()
-        SectionButton(section: .recording, title: "Audio tools")
-        Divider()
-        OpenSettingsButton()
-        Button("Check for Updates…") { UpdatesWindow.show(beforeQuit: {}) }
-        Button("Babelfin Help") { AppLinks.openHelp() }
-        AboutMenuButton()
-        Divider()
-        Button("Quit Babelfin") { conversation.abort(); NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
+    @Published var selection: SettingsDestination
+    @Published var languagePage: LanguageSettingsView.Page = .suggestions
+    init(selection: SettingsDestination) { self.selection = selection.tab; apply(selection) }
+    func apply(_ destination: SettingsDestination) {
+        selection = destination.tab
+        if destination == .outgoing { languagePage = .speak }
+        if destination == .incoming { languagePage = .listen }
     }
 }
-private struct StatusDirectionItems: View {
+
+/// The menu bar panel: each direction's state, actions, what you hear and a volume slider,
+/// then the windows. A window-style menu bar extra can hold sliders; a plain menu cannot.
+struct ConversationMenu: View {
+    @ObservedObject var conversation: ConversationModel
+    @ObservedObject private var subtitles = SubtitleOverlay.shared
+    @Environment(\.openWindow) private var openWindow
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            MenuBarDirection(model: conversation.outgoing, title: "Speak", shortcut: "⇧⌘T")
+            Divider().padding(.vertical, 6)
+            MenuBarDirection(model: conversation.incoming, title: "Listen", shortcut: "⌥⇧⌘T")
+            Divider().padding(.vertical, 6)
+            row("Open Babelfin", shortcut: "⌘1") { MainNavigation.open(.home, openWindow: openWindow) }
+            row("Transcript", shortcut: "⌘2") { MainNavigation.open(.transcript, openWindow: openWindow) }
+            row(subtitles.visible ? "Hide Subtitles" : "Show Subtitles", shortcut: "⌥⌘U") { subtitles.toggle() }
+            row("Compact Controls", shortcut: "⌘0") { MainNavigation.openCompact(openWindow: openWindow) }
+            Divider().padding(.vertical, 6)
+            MenuBarSettingsRow()
+            Menu {
+                Button("Babelfin Help") { AppLinks.openHelp() }
+                Button("Check for Updates…") { UpdatesWindow.show(beforeQuit: {}) }
+                AboutMenuButton()
+                Link("Babelfin Website", destination: AppLinks.website)
+            } label: {
+                HStack {
+                    Text("Help, Updates and About")
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden)
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            Divider().padding(.vertical, 6)
+            row("Quit Babelfin", shortcut: "⌘Q") { conversation.abort(); NSApplication.shared.terminate(nil) }
+                .keyboardShortcut("q")
+        }
+        .padding(8)
+        .frame(width: 300)
+        .modifier(NoFocusRing())
+    }
+    private func row(_ title: String, shortcut: String? = nil, action: @escaping () -> Void) -> some View {
+        MenuBarRow(title: title, shortcut: shortcut, action: action)
+    }
+}
+
+/// Menu rows show a hover highlight; a keyboard focus ring on the first row looks like a selection.
+struct NoFocusRing: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) { content.focusEffectDisabled() } else { content }
+    }
+}
+
+/// A button that looks like a menu item: full width, highlighted under the pointer.
+private struct MenuBarRow: View {
+    let title: String
+    var shortcut: String?
+    let action: () -> Void
+    @StateObject private var hover = MenuBarHover()
+    var body: some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                Spacer()
+                if let shortcut { Text(shortcut).foregroundStyle(.secondary) }
+            }
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .background(hover.inside ? Color.accentColor.opacity(0.25) : .clear, in: RoundedRectangle(cornerRadius: 5))
+        }
+        .buttonStyle(.plain)
+        .onHover { hover.inside = $0 }
+    }
+}
+/// `@State` needs the SwiftUI macro plugin, which the command-line toolchain lacks.
+@MainActor private final class MenuBarHover: ObservableObject { @Published var inside = false }
+
+private struct MenuBarSettingsRow: View {
+    var body: some View {
+        if #available(macOS 14.0, *) { ModernRow() } else {
+            MenuBarRow(title: "Settings…", shortcut: "⌘,") { NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) }
+        }
+    }
+    @available(macOS 14.0, *)
+    private struct ModernRow: View {
+        @Environment(\.openSettings) private var openSettings
+        var body: some View {
+            MenuBarRow(title: "Settings…", shortcut: "⌘,") { openSettings(); NSApp.activate(ignoringOtherApps: true) }
+        }
+    }
+}
+
+/// One direction in the menu bar panel.
+private struct MenuBarDirection: View {
     @ObservedObject var model: AppModel
     let title: String
+    let shortcut: String
     private var actions: TranslationControlActions { TranslationControlActions(model: model) }
     var body: some View {
-        Text("\(title) · \(model.shortStatus) · \(model.languageSummary)")
-        Button(actions.primaryTitle) { Task { await actions.performPrimary() } }.disabled(actions.primaryDisabled)
-        if !actions.muteDisabled {
-            Button(model.muted ? "Unmute" : "Mute") { Task { await actions.toggleMute() } }
-        }
-        if !actions.offDisabled {
-            Button("Off") { Task { await actions.turnOff() } }
-        }
-        if !model.pendingRestart.isEmpty {
-            Button("Restart to Apply Changes") { Task { await model.restartTranslation() } }
-        }
-        Picker("Hear: \(model.hearing.title)", selection: Binding(get: { model.hearing }, set: { model.hearing = $0 })) {
-            ForEach(AppModel.Hearing.allCases) { Text($0.title).tag($0) }
-        }
-        Picker("Volume: \(Int((model.outputVolume * 100).rounded()))%", selection: Binding(
-            get: { Int((model.outputVolume * 10).rounded()) }, set: { model.outputVolume = Double($0) / 10 })) {
-            ForEach((0...10).reversed(), id: \.self) { Text("\($0 * 10)%").tag($0) }
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Circle().fill(model.statusColor).frame(width: 7, height: 7).accessibilityHidden(true)
+                Text("\(title) · \(model.shortStatus) · \(model.languageSummary)")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary).lineLimit(1)
+            }.padding(.horizontal, 8)
+            MenuBarRow(title: actions.primaryTitle, shortcut: shortcut) { Task { await actions.performPrimary() } }
+                .disabled(actions.primaryDisabled)
+            if !actions.muteDisabled {
+                MenuBarRow(title: model.muted ? "Unmute" : "Mute") { Task { await actions.toggleMute() } }
+            }
+            if !actions.offDisabled {
+                MenuBarRow(title: "Off") { Task { await actions.turnOff() } }
+            }
+            if !model.pendingRestart.isEmpty {
+                MenuBarRow(title: "Restart to apply changes") { Task { await model.restartTranslation() } }
+            }
+            HStack(spacing: 8) {
+                Text("Hear").foregroundStyle(.secondary)
+                HearingPicker(model: model, incoming: title == "Listen").controlSize(.small)
+            }.padding(.horizontal, 8).padding(.vertical, 2)
+            HStack(spacing: 8) {
+                Image(systemName: "speaker.fill").foregroundStyle(.secondary).accessibilityHidden(true)
+                Slider(value: $model.outputVolume, in: 0...1).controlSize(.small)
+                    .accessibilityLabel("\(title) output volume")
+                    .accessibilityValue("\(Int((model.outputVolume * 100).rounded())) percent")
+                Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary).accessibilityHidden(true)
+            }.padding(.horizontal, 8).padding(.vertical, 2)
         }
     }
 }
@@ -133,11 +212,6 @@ struct MeetingTranscriptView: View {
     @StateObject private var options = MeetingCopyOptions()
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Transcript").font(.title2.weight(.semibold))
-                Text("Text from both translation directions stays here until you clear it or quit. Original-only audio is not transcribed.")
-                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
             HStack(spacing: 12) {
                 Picker("Include", selection: $options.selection) {
                     ForEach(TranscriptExport.Selection.allCases, id: \.self) { Text($0.rawValue).tag($0) }
@@ -186,9 +260,16 @@ struct MeetingTranscriptView: View {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(conversation.transcript.entries) { entry in
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("\(entry.direction.label) · \(entry.role == .source ? "Original" : "Translation")\(entry.segment.speaker.map { " · Speaker \($0)" } ?? "")")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(entry.role == .source ? Color.secondary : Color.accentColor)
+                                HStack(spacing: 4) {
+                                    Text("\(entry.direction.label) · \(entry.role == .source ? "Original" : "Translation")")
+                                    if let speaker = conversation.transcript.speakerLabel(entry) {
+                                        Text("·")
+                                        Button(speaker) { conversation.renameSpeaker(of: entry) }
+                                            .buttonStyle(.link).help("Rename this speaker")
+                                    }
+                                }
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(entry.role == .source ? Color.secondary : Color.accentColor)
                                 Text(entry.segment.text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                             }
                             .padding(.leading, 10)

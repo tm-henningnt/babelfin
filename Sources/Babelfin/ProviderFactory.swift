@@ -26,7 +26,17 @@ import BridgeCore
         }
     }
     static func recognizer(_ id: String) -> (any StreamingSpeechRecognizer)? {
-        id == ProviderRegistry.elevenLabsScribe.id ? ElevenLabsSpeechRecognizer() : nil
+        switch id {
+        case ProviderRegistry.elevenLabsScribe.id: return ElevenLabsSpeechRecognizer()
+        case ProviderRegistry.openAILiveTranscribe.id: return OpenAILiveRecognizer()
+        case ProviderRegistry.fishLiveTranscribe.id: return FishLiveRecognizer()
+        case ProviderRegistry.appleRecognition.id:
+            #if canImport(Speech)
+            if #available(macOS 26.0, *) { return AppleLocalRecognizer(engine: SpeechAnalyzerEngine()) }
+            #endif
+            return nil
+        default: return nil
+        }
     }
     static func translator(_ id: String) -> (any TextTranslationStage)? {
         switch id {
@@ -34,6 +44,11 @@ import BridgeCore
         case ProviderRegistry.serverText.id:
             guard let endpoint = TranslationServerSettings.load() else { return UnconfiguredTextTranslationStage() }
             return OpenAICompatibleTextTranslationStage(endpoint: endpoint)
+        case ProviderRegistry.appleTranslation.id:
+            #if canImport(Translation)
+            if #available(macOS 26.0, *) { return AppleTranslationStage() }
+            #endif
+            return nil
         default: return nil
         }
     }
@@ -41,6 +56,7 @@ import BridgeCore
         switch id {
         case ProviderRegistry.elevenLabsSpeech.id: return ElevenLabsSpeechSynthesisStage()
         case ProviderRegistry.fishSpeech.id: return FishSpeechSynthesisStage()
+        case ProviderRegistry.appleSpeech.id: return AppleSpeechSynthesisStage()
         default: return nil
         }
     }

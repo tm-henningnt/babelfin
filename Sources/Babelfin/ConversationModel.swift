@@ -17,7 +17,6 @@ import BridgeCore
         let outgoing = AppModel()
         let incoming = AppModel(providerFactory: { OpenAITranslationProvider() },
             preferences: UserDefaultsAppPreferences(key: "babelfin.incoming.preferences.v1"),
-            keyPresence: { KeychainStore.containsSavedKey() },
             serviceKeyPresence: { KeychainStore.containsSavedKey(for: $0) },
             providerResolver: { ProviderFactory.make($0) }, loadProviderCredentials: { try KeychainStore.credentials(for: $0) },
             selectsMeetingSource: true, playsLoopbackOriginal: AppModel.microphoneAuthorized)
@@ -68,6 +67,20 @@ import BridgeCore
         _ = await (first, second)
     }
     func clearTranscript() { transcript.clear(); exportNotice = "" }
+    /// Asks for a name for the entry's speaker label. The name stays on this Mac.
+    func renameSpeaker(of entry: MeetingTranscript.Entry) {
+        guard let current = transcript.speakerLabel(entry) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename \(current)"
+        alert.informativeText = "The name applies to this speaker in this session. Babelfin does not send it to a service."
+        let field = NSTextField(string: current.hasPrefix("Speaker ") ? "" : current)
+        field.placeholderString = "Name"; field.frame = NSRect(x: 0, y: 0, width: 240, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        transcript.renameSpeaker(of: entry, to: field.stringValue)
+    }
     func copyTranscript(selection: TranscriptExport.Selection = .both, prompt: TranscriptExport.Prompt = .none) {
         let text = TranscriptExport.wrapping(transcript.plainText(selection: selection), prompt: prompt); guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()

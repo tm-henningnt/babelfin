@@ -16,15 +16,18 @@ public final class SpeechRateStretcher: @unchecked Sendable {
     private var tail: [Float]        // second half of the previous output frame, awaiting overlap
     private var previousNatural: [Float]? // continuation of the last frame, the WSOLA similarity target
     public private(set) var rate: Double = 1
+    private let range: ClosedRange<Double>
 
-    public init() {
+    /// `range` limits `setRate`. Live catch-up uses the default; a voice clip may go slower.
+    public init(range: ClosedRange<Double> = minimumRate...maximumRate) {
+        self.range = range
         window = (0..<480).map { Float(0.5 - 0.5 * cos(2 * Double.pi * Double($0) / 480)) }
         tail = [Float](repeating: 0, count: 240)
     }
 
     /// Sets the rate for audio processed from now on; the change is gradual by construction.
     public func setRate(_ value: Double) {
-        rate = value.isFinite ? min(Self.maximumRate, max(Self.minimumRate, value)) : 1
+        rate = value.isFinite ? min(range.upperBound, max(range.lowerBound, value)) : 1
     }
 
     /// Returns stretched PCM16 for the PCM16 chunk; output may lag input by one frame.

@@ -29,6 +29,13 @@ struct SpeechToolsView: View {
                 Divider()
             }
             VStack(spacing: 0) {
+                if !showsSidebar {
+                    Picker("Tool", selection: Binding(get: { model.page ?? .voice }, set: { model.page = $0 })) {
+                        ForEach([SpeechToolsPage.voice, .recording, .notes]) { page in Label(page.title, systemImage: page.symbol).tag(page) }
+                    }
+                    .pickerStyle(.segmented).labelsHidden().fixedSize()
+                    .padding(.top, 16).padding(.bottom, 4)
+                }
                 Group {
                     switch model.page ?? .recording {
                     case .recording: recordingPage
@@ -110,11 +117,11 @@ struct SpeechToolsView: View {
                             Toggle("Keep the original under the dub", isOn: $model.dubIncludesOriginal).disabled(model.busy)
                             HStack {
                                 Button("Create dub") { model.createDub() }
-                                    .disabled(!model.canDub || model.missingKeys.contains(model.voiceAccount))
+                                    .disabled(!model.canDub || model.voiceKeyMissing)
                                 if model.dub != nil { Button("Save WAV…") { model.saveDub() }.disabled(model.busy) }
                             }
                             Text(dubHelp(recording)).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                            missingKey(model.voiceAccount)
+                            if let account = model.voiceAccount { missingKey(account) }
                         } header: { Text("Dub") }
                     }
                     Section {
@@ -197,23 +204,22 @@ struct SpeechToolsView: View {
             Form {
                 Section {
                     Picker("Voice service", selection: $model.voiceProvider) {
-                        ForEach(VoiceProvider.allCases) { Text($0.displayName).tag($0) }
+                        ForEach(ClipVoiceService.allCases) { Text($0.displayName).tag($0) }
                     }.disabled(model.busy)
                     Picker("Language", selection: $model.voiceLanguage) {
                         ForEach(model.voiceLanguages) { Text($0.name).tag($0.code) }
                     }.disabled(model.busy)
                     HStack(spacing: 12) {
                         Picker("Voice", selection: $model.voiceID) {
-                            Text(model.voiceProvider == .fish ? "Default voice" : "Choose a voice").tag("")
+                            Text(model.voiceProvider == .elevenLabs ? "Choose a voice" : "Default voice").tag("")
                             ForEach(model.readyVoices) { Text($0.name).tag($0.id) }
                         }
                         Button(model.voicesLoaded ? "Refresh" : "Load voices") { model.refreshVoices() }
                             .accessibilityLabel("Load voices from \(model.voiceProvider.displayName)")
-                            .disabled(model.missingKeys.contains(model.voiceAccount))
+                            .disabled(model.voiceKeyMissing)
                     }.disabled(model.busy)
-                    Text(voiceHelp)
-                        .font(.caption).foregroundStyle(.secondary)
-                    missingKey(model.voiceAccount)
+                    if !voiceHelp.isEmpty { Text(voiceHelp).font(.caption).foregroundStyle(.secondary) }
+                    if let account = model.voiceAccount { missingKey(account) }
                 }
                 Section {
                     Picker("Speak", selection: $model.voiceSource) {
@@ -229,7 +235,7 @@ struct SpeechToolsView: View {
                             Text("\(speedText)×").monospacedDigit().frame(width: 48, alignment: .trailing)
                         }
                     }
-                    Text(deliveryHelp).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if !deliveryHelp.isEmpty { Text(deliveryHelp).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
                 } header: { Text("Delivery") }
                 .disabled(model.busy)
                 if model.voiceSource == .recording {
@@ -241,61 +247,60 @@ struct SpeechToolsView: View {
                             Button(model.takes.isEmpty ? "Give it a new voice" : "Generate another take") { model.generateClip() }
                                 .buttonStyle(.borderedProminent)
                                 .disabled(!model.canRevoice || model.microphoneRecording == nil || model.missingKeys.contains(.elevenLabs))
-                            if model.clip != nil { Button("Save WAV…") { model.saveClip() }.disabled(model.busy) }
                         }
                     } header: { Text("Your recording") }
                 } else {
                     Section {
-                        textEditor($model.voiceText, label: "Voice clip text", placeholder: "Write the words you want to hear…", height: 150)
-                        HStack(spacing: 6) {
-                            Text("Add").font(.caption).foregroundStyle(.secondary)
-                            ForEach(["[whispers]", "[laughs]", "[sighs]", "[excited]", "[pause]"], id: \.self) { tag in
-                                Button(tag) { model.appendTag(tag) }.controlSize(.small)
-                                    .accessibilityLabel("Add the \(tag.dropFirst().dropLast()) tag")
+                        if #available(macOS 15.0, *) {
+                            TaggedTextEditor(model: model, tagsAvailable: model.voiceProvider == .elevenLabs)
+                        } else {
+                            textEditor($model.voiceText, label: "Voice clip text", placeholder: "Write the words you want to hear…", height: 96)
+                            if model.voiceProvider == .elevenLabs {
+                                TagButtons { model.appendTag($0) }.disabled(model.busy)
                             }
-                        }.disabled(model.busy)
+                        }
                         HStack {
                             Text("\(model.voiceText.count.formatted()) / 2,000 characters")
                                 .foregroundStyle(model.voiceText.count > SpeechToolsLimits.voiceCharacters ? Color.orange : Color.secondary)
                                 .font(.caption).monospacedDigit()
                             Spacer()
                             Button(model.takes.isEmpty ? "Generate clip" : "Generate another take") { model.generateClip() }.buttonStyle(.borderedProminent)
-                                .disabled(!model.canGenerate || model.missingKeys.contains(model.voiceAccount))
-                            if model.clip != nil { Button("Save WAV…") { model.saveClip() }.disabled(model.busy) }
+                                .disabled(!model.canGenerate || model.voiceKeyMissing)
                         }
                         if model.voiceText.utf8.count > 8_000 && model.voiceText.count <= SpeechToolsLimits.voiceCharacters {
                             Text("This text is too long for one clip. Shorten it, then generate again.")
                                 .font(.caption).foregroundStyle(.orange)
                         }
-                        Text("\(model.voiceProvider.displayName) receives this text for speech generation.")
+                        Text(model.voiceProvider == .system ? "The text stays on this Mac."
+                             : "\(model.voiceProvider.displayName) receives this text for speech generation.")
                             .font(.caption).foregroundStyle(.secondary)
                     } header: { Text("Words to speak") }
                 }
-                if !model.takes.isEmpty {
-                    Section {
-                        Picker("Take", selection: $model.selectedTakeID) {
-                            ForEach(model.takes.reversed()) { Text($0.title).tag(Optional($0.id)) }
-                        }.disabled(model.busy)
-                        Picker("Listen through", selection: $model.previewOutputUID) {
-                            Text("Choose headphones or speakers").tag("")
-                            if !model.previewOutputUID.isEmpty && !model.previewOutputs.contains(where: { $0.uid == model.previewOutputUID }) {
-                                Text("Selected device — disconnected").tag(model.previewOutputUID)
-                            }
-                            ForEach(model.previewOutputs) { Text($0.name).tag($0.uid) }
-                        }
-                        HStack {
-                            Button(model.playingClip ? "Stop" : "Play") {
-                                if model.playingClip { model.stopClip() } else { model.playClip() }
-                            }.disabled(!model.playingClip && !model.canPlayClip)
-                            Text("Playback stays on the device you choose.").font(.caption).foregroundStyle(.secondary)
-                        }
-                    } header: { Text("Preview") }
-                }
-                if let clip = model.clip {
-                    Text("\(clipDuration(clip)) ready to save.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
             }.formStyle(.grouped)
+            // The takes and the player stay in view below the form.
+            if !model.takes.isEmpty {
+                Divider()
+                HStack(spacing: 12) {
+                    Button(model.playingClip ? "Stop" : "Play") {
+                        if model.playingClip { model.stopClip() } else { model.playClip() }
+                    }.disabled(!model.playingClip && !model.canPlayClip).keyboardShortcut(.space, modifiers: [])
+                    Picker("Take", selection: $model.selectedTakeID) {
+                        ForEach(model.takes.reversed()) { Text($0.title).tag(Optional($0.id)) }
+                    }.disabled(model.busy).frame(maxWidth: 260)
+                    Picker("Through", selection: $model.previewOutputUID) {
+                        Text("Choose headphones or speakers").tag("")
+                        if !model.previewOutputUID.isEmpty && !model.previewOutputs.contains(where: { $0.uid == model.previewOutputUID }) {
+                            Text("Selected device — disconnected").tag(model.previewOutputUID)
+                        }
+                        ForEach(model.previewOutputs) { Text($0.name).tag($0.uid) }
+                    }.frame(maxWidth: 260)
+                    Spacer(minLength: 0)
+                    if let clip = model.clip {
+                        Text(clipDuration(clip)).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                        Button("Save WAV…") { model.saveClip() }.disabled(model.busy)
+                    }
+                }.padding(.horizontal, 20).padding(.vertical, 10)
+            }
         }
     }
 
@@ -313,15 +318,21 @@ struct SpeechToolsView: View {
             return SpeechToolsError.dubUntimed.errorDescription ?? ""
         }
         if model.voiceProvider == .elevenLabs && model.voiceID.isEmpty { return "Choose a voice under Voice clip first." }
-        return "Speaks the translation at the original times with the voice and delivery from Voice clip. \(model.voiceProvider.displayName) receives about \(model.dubCharacters.formatted()) characters. The original stays on this Mac."
+        let upload = model.voiceProvider == .system ? "The translation and the original stay on this Mac."
+            : "\(model.voiceProvider.displayName) receives about \(model.dubCharacters.formatted()) characters. The original stays on this Mac."
+        return "Speaks the translation at the original times with the voice and delivery from Voice clip. " + upload
     }
 
-    private var speedText: String { model.voiceSpeed.formatted(.number.precision(.fractionLength(2))) }
+    private var speedText: String { String(format: "%.2f", model.voiceSpeed) }
 
     private var deliveryHelp: String {
+        switch model.voiceProvider {
+        case .system: return "System voices read every delivery the same way. Speed applies."
+        case .gemini: return "Gemini reads every delivery the same way. Speed applies."
+        case .elevenLabs, .fish: break
+        }
         switch model.voiceDelivery {
-        case .steady: return "An even, consistent read."
-        case .natural: return "The voice's usual delivery."
+        case .steady, .natural: return ""
         case .expressive: return model.voiceProvider == .elevenLabs
             ? "More emotion and variation. Uses ElevenLabs v3, which performs tags such as [whispers] best and takes longer."
             : "More emotion and variation. Fish Audio performs tags such as [whispers]."
@@ -329,13 +340,19 @@ struct SpeechToolsView: View {
     }
 
     private var voiceHelp: String {
+        if model.voiceProvider == .system {
+            return "The default is the best installed voice for the language. Add voices in System Settings › Accessibility › Read & Speak."
+        }
+        if model.voiceProvider == .gemini {
+            return "Gemini's voices speak every language. The default is \(GeminiSpeechSynthesisStage.defaultVoice)."
+        }
         if model.voiceProvider == .elevenLabs && model.voiceID.isEmpty {
             if model.voicesLoaded && model.readyVoices.isEmpty {
                 return "No ready voices were found. Check voice access in your ElevenLabs account, then refresh."
             }
             return model.voicesLoaded ? "Choose a voice to generate your clip." : "Load voices, then choose one to generate a clip."
         }
-        return "Use a ready account voice, including one you have created in Settings."
+        return ""
     }
 
     private func recordingText(_ recording: RecordingTranscript) -> some View {
@@ -355,7 +372,11 @@ struct SpeechToolsView: View {
             }.frame(maxWidth: .infinity, alignment: .leading)
         }.frame(minHeight: 180, maxHeight: 320)
     }
-    private func heading(_ title: String, _ description: String) -> some View {
+    @ViewBuilder private func heading(_ title: String, _ description: String) -> some View {
+        // In the main window the tabs name the tool.
+        if showsSidebar { headingText(title, description) }
+    }
+    private func headingText(_ title: String, _ description: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title).font(.title2.weight(.semibold))
             Text(description).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -464,4 +485,50 @@ private struct MicrophoneControls: View {
         let whole = Int(seconds.rounded(.down))
         return "\(whole / 60):" + String(format: "%02d", whole % 60)
     }
+}
+
+/// The voice clip tags. ElevenLabs performs them; other services would speak them as words.
+private struct TagButtons: View {
+    var add: (String) -> Void
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("Add").font(.caption).foregroundStyle(.secondary)
+            ForEach(["[whispers]", "[laughs]", "[sighs]", "[excited]", "[pause]"], id: \.self) { tag in
+                Button(tag) { add(tag) }.controlSize(.small)
+                    .accessibilityLabel("Add the \(tag.dropFirst().dropLast()) tag")
+            }
+        }
+    }
+}
+
+/// The voice clip text with tag buttons that insert at the cursor or replace the selection.
+@available(macOS 15.0, *)
+private struct TaggedTextEditor: View {
+    @ObservedObject var model: SpeechToolsModel
+    var tagsAvailable: Bool
+    @StateObject private var editor = EditorSelection()
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            TextEditor(text: $model.voiceText, selection: $editor.selection).font(.body).accessibilityLabel("Voice clip text")
+                .disabled(model.busy).padding(4).scrollContentBackground(.hidden)
+            if model.voiceText.isEmpty {
+                Text("Write the words you want to hear…").foregroundStyle(.secondary).padding(.horizontal, 9).padding(.vertical, 12)
+                    .allowsHitTesting(false).accessibilityHidden(true)
+            }
+        }.frame(height: 96)
+        if tagsAvailable {
+            TagButtons { tag in
+                guard case .selection(let range) = editor.selection?.indices, range.upperBound <= model.voiceText.endIndex else {
+                    model.appendTag(tag); return
+                }
+                let cursor = model.insertTag(tag, replacing: range)
+                editor.selection = TextSelection(insertionPoint: cursor)
+            }.disabled(model.busy)
+        }
+    }
+}
+
+@available(macOS 15.0, *)
+private final class EditorSelection: ObservableObject {
+    @Published var selection: TextSelection?
 }

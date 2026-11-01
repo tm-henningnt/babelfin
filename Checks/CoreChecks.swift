@@ -299,7 +299,7 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
             ("Route advisor fixes the user's language, detects the meeting's, and ranks available routes first", {
                 // Norwegian speaker in an English meeting.
                 let voice = RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "no", meetingLanguage: "en", savedServices: [.openAI])
-                try expect(voice.map(\.route.id) == ["openai", "palabra", "elevenlabs", "fish", "gemini"], "An available route must come first: \(voice.map(\.route.id))")
+                try expect(voice.map(\.route.id) == ["openai", "palabra", "elevenlabs", "elevenlabs-openai", "fish-openai", "fish", "gemini"], "An available route must come first: \(voice.map(\.route.id))")
                 let eleven = voice.first { $0.route.id == "elevenlabs" }
                 try expect(voice[0].sourceLanguage == nil && eleven?.sourceLanguage == "no" && eleven?.missingServices == [.elevenLabs]
                            && voice.first { $0.route.id == "gemini" }?.sourceLanguage == nil,
@@ -315,6 +315,15 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
                            "Routes that cannot speak the target must not be offered")
                 try expect(RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "en", meetingLanguage: "en", savedServices: []).isEmpty,
                            "Same input and output language needs no translation")
+                let languages = [TranslationLanguage(code: "no", name: "Norwegian"), TranslationLanguage(code: "en", name: "English")]
+                let local = try RouteDescriptor(id: "apple-local", displayName: "On this Mac", stages: [
+                    StageDescriptor(id: "r", kind: .recognition, service: nil, displayName: "r", modelID: "r", inputLanguages: languages, outputLanguages: nil, acceptsLanguageHint: true),
+                    StageDescriptor(id: "t", kind: .translation, service: nil, displayName: "t", modelID: "t", inputLanguages: nil, outputLanguages: languages),
+                    StageDescriptor(id: "s", kind: .synthesis, service: nil, displayName: "s", modelID: "s", inputLanguages: nil, outputLanguages: languages)])
+                let withLocal = RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "no", meetingLanguage: "en", savedServices: [.openAI, .elevenLabs],
+                                                         routes: ProviderRegistry.routes + [local])
+                try expect(withLocal.first?.route.id == "elevenlabs" && withLocal.contains { $0.route.id == "apple-local" },
+                           "A ready route with an account ranks above On this Mac: \(withLocal.map(\.route.id))")
             }),
             ("Key check classifies provider answers without trusting pre-auth validation", {
                 func body(_ text: String) -> Data { Data(text.utf8) }

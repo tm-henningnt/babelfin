@@ -5,7 +5,10 @@ import Foundation
 public struct TranslationRoute: RawRepresentable, Hashable, Codable, Sendable, Identifiable {
     public let rawValue: String
     public init?(rawValue: String) {
-        guard ProviderRegistry.routes.contains(where: { $0.id == rawValue }) else { return nil }
+        // The on-device languages load after the preferences, so a saved on-device route decodes before it is offered.
+        let local: Bool
+        if #available(macOS 26.0, *) { local = rawValue == Self.appleLocal.rawValue } else { local = false }
+        guard local || ProviderRegistry.routes.contains(where: { $0.id == rawValue }) else { return nil }
         self.rawValue = rawValue
     }
     private init(registered id: String) { rawValue = id }
@@ -15,6 +18,7 @@ public struct TranslationRoute: RawRepresentable, Hashable, Codable, Sendable, I
     public static let gemini = TranslationRoute(registered: "gemini")
     public static let palabra = TranslationRoute(registered: "palabra")
     public static let azure = TranslationRoute(registered: "azure")
+    public static let appleLocal = TranslationRoute(registered: "apple-local")
     public static var allCases: [TranslationRoute] { ProviderRegistry.routes.map { TranslationRoute(registered: $0.id) } }
     public var id: String { rawValue }
     public var descriptor: RouteDescriptor { ProviderRegistry.route(self) }

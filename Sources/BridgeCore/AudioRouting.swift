@@ -5,7 +5,7 @@ public enum AudioDestination: String, CaseIterable, Identifiable {
     public var id: String { rawValue }
     public var label: String {
         switch self {
-        case .teams: return "Teams virtual microphone"
+        case .teams: return "Virtual microphone for calls"
         case .listen: return "My headphones"
         }
     }
@@ -37,7 +37,7 @@ public enum AudioRouting {
         switch destination {
         case .teams:
             guard output.kind == .blackHole, output.outputChannels >= 2 else {
-                throw BridgeError.unavailable("Teams mode requires BlackHole as the output.")
+                throw BridgeError.unavailable("A call needs BlackHole as the output.")
             }
         case .listen:
             guard output.kind == .physical else {

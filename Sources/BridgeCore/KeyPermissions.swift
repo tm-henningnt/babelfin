@@ -68,7 +68,7 @@ public enum KeyPermissions {
                       probe: KeyProbe(method: "POST", url: url("https://api.elevenlabs.io/v1/voices/\(absentVoice)/edit"),
                                       body: .multipart([.init(name: "name", value: "Babelfin key check")]))),
         KeyPermission(id: "openai.realtime", service: .openAI, name: "Realtime",
-                      uses: [.stage(ProviderRegistry.openAIRealtime.id)],
+                      uses: [.stage(ProviderRegistry.openAIRealtime.id), .stage(ProviderRegistry.openAILiveTranscribe.id)],
                       probe: KeyProbe(method: "POST", url: url("https://api.openai.com/v1/realtime/client_secrets"),
                                       body: .json(#"{"session":{"type":"none"}}"#))),
         KeyPermission(id: "openai.responses", service: .openAI, name: "Responses API",

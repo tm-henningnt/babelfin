@@ -14,8 +14,8 @@ swiftc -parse-as-library -D LIFECYCLE_CHECKS -strict-concurrency=complete -warn-
   Sources/Babelfin/AudioPipelineControlling.swift Sources/Babelfin/AudioPipeline.swift Sources/Babelfin/DeviceInputCapture.swift \
   Sources/Babelfin/AudioDevices.swift Sources/Babelfin/KeychainStore.swift Sources/Babelfin/LocalCredentialStore.swift \
   Sources/Babelfin/SocketRedirectPolicy.swift Sources/Babelfin/OpenAITranslationProvider.swift \
-  Sources/Babelfin/ProviderFactory.swift Sources/Babelfin/DirectServiceWires.swift Sources/Babelfin/TranslationServerSettings.swift Sources/Babelfin/ComposedTranslationProvider.swift \
+  Sources/Babelfin/ProviderFactory.swift Sources/Babelfin/AppleLocalStages.swift Sources/Babelfin/AppleLocalRecognizer.swift Sources/Babelfin/DirectServiceWires.swift Sources/Babelfin/TranslationServerSettings.swift Sources/Babelfin/ComposedTranslationProvider.swift \
   Sources/Babelfin/ProviderNetwork.swift Sources/Babelfin/ComposedNetworkStages.swift \
-  Sources/Babelfin/ElevenLabsSpeechRecognizer.swift Checks/LifecycleChecks.swift \
+  Sources/Babelfin/ElevenLabsSpeechRecognizer.swift Sources/Babelfin/RecognitionSocketSession.swift Sources/Babelfin/OpenAILiveRecognizer.swift Sources/Babelfin/FishLiveRecognizer.swift Checks/LifecycleChecks.swift \
   -o "$CHECK_DIR/LifecycleChecks"
 "$CHECK_DIR/LifecycleChecks"

@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
@@ -28,7 +29,7 @@ struct VoiceTake: Identifiable, Equatable {
     let number: Int
     let direction: SpeechDirection
     let audio: Data
-    var title: String { "Take \(number) · \(direction.delivery.displayName) · \(direction.speed.formatted(.number.precision(.fractionLength(2))))×" }
+    var title: String { "Take \(number) · \(direction.delivery.displayName) · \(String(format: "%.2f", direction.speed))×" }
 }
 
 /// Where Audio file takes its audio from.
@@ -51,8 +52,76 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
     deinit { NotificationCenter.default.removeObserver(token) }
 }
 
+/// The services that speak a voice clip or a dub.
+enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
+    case elevenLabs, fish, gemini, system
+    var id: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .elevenLabs: return "ElevenLabs"
+        case .fish: return "Fish Audio"
+        case .gemini: return "Gemini"
+        case .system: return "System voices on this Mac"
+        }
+    }
+    /// The key the service needs. The system voices need none.
+    var account: ProviderService? {
+        switch self {
+        case .elevenLabs: return .elevenLabs
+        case .fish: return .fish
+        case .gemini: return .gemini
+        case .system: return nil
+        }
+    }
+    /// The account that lists voices, or nil when Babelfin has the list.
+    var accountVoices: VoiceProvider? {
+        switch self {
+        case .elevenLabs: return .elevenLabs
+        case .fish: return .fish
+        case .gemini, .system: return nil
+        }
+    }
+    /// The voices Babelfin lists without a request.
+    @MainActor var localVoices: [ProviderVoice] {
+        switch self {
+        case .elevenLabs, .fish: return []
+        case .gemini:
+            return GeminiSpeechSynthesisStage.voices.map {
+                ProviderVoice(id: $0, name: $0, provider: nil, state: "available", isReady: true)
+            }
+        case .system: return Self.installedSystemVoices()
+        }
+    }
+    var route: TranslationRoute {
+        switch self {
+        case .elevenLabs: return .elevenLabs
+        case .fish: return .fish
+        case .gemini: return .gemini
+        case .system: return .appleLocal
+        }
+    }
+
+    /// The installed system voices, best quality first.
+    @MainActor static func installedSystemVoices() -> [ProviderVoice] {
+        AVSpeechSynthesisVoice.speechVoices()
+            .filter { !AppleSpeechSynthesisStage.isPersonalVoice($0) }
+            .sorted { ($0.quality.rawValue, $1.name) > ($1.quality.rawValue, $0.name) }
+            .map { voice in
+                return ProviderVoice(id: voice.identifier, name: voice.name + qualitySuffix(voice.quality), provider: nil, state: "available",
+                                     isReady: true, language: AppleLanguage.babelfin(AppleLanguage.code(voice.language)))
+            }
+    }
+    private static func qualitySuffix(_ quality: AVSpeechSynthesisVoiceQuality) -> String {
+        switch quality {
+        case .premium: return " (Premium)"
+        case .enhanced: return " (Enhanced)"
+        default: return ""
+        }
+    }
+}
+
 @MainActor final class SpeechToolsModel: ObservableObject {
-    @Published var page: SpeechToolsPage? = .recording
+    @Published var page: SpeechToolsPage? = .voice
     @Published private(set) var busy = false
     @Published private(set) var progress: SpeechToolsProgress?
     @Published private(set) var operationTitle = ""
@@ -90,14 +159,22 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
     @Published var notesInput: String { didSet { if notesInput != oldValue { notesResult = nil; clearNotice() } } }
     @Published private(set) var notesResult: MeetingNotes?
     @Published var voiceText = "" { didSet { if voiceText != oldValue { clearTakes(); clearNotice() } } }
-    @Published var voiceProvider: VoiceProvider = .elevenLabs {
+    @Published var voiceProvider: ClipVoiceService = .elevenLabs {
         didSet {
             guard voiceProvider != oldValue else { return }
             voices = []; voiceID = ""; clearTakes(); voicesLoaded = false; clearNotice()
+            // Babelfin has the Gemini and system voice lists, so they load at once.
+            if voiceProvider.accountVoices == nil { voices = voiceProvider.localVoices; voicesLoaded = true }
             if !voiceLanguages.contains(where: { $0.code == voiceLanguage }) { voiceLanguage = "en" }
         }
     }
-    @Published var voiceLanguage = "en" { didSet { if voiceLanguage != oldValue { clearTakes(); clearNotice() } } }
+    @Published var voiceLanguage = "en" {
+        didSet {
+            guard voiceLanguage != oldValue else { return }
+            clearTakes(); clearNotice()
+            if !voiceID.isEmpty, !readyVoices.contains(where: { $0.id == voiceID }) { voiceID = "" }
+        }
+    }
     @Published var voiceID = "" { didSet { if voiceID != oldValue { clearTakes(); clearNotice() } } }
     /// Delivery and speed change only the next take; earlier takes stay for comparison.
     @Published var voiceDelivery: SpeechDirection.Delivery = .natural
@@ -140,7 +217,8 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
              return try await Task.detached {
                  try ProviderCredentials(openAI: services.contains(.openAI) ? KeychainStore.load(for: .openAI, storage: storage) : nil,
                      elevenLabs: services.contains(.elevenLabs) ? KeychainStore.load(for: .elevenLabs, storage: storage) : nil,
-                     fish: services.contains(.fish) ? KeychainStore.load(for: .fish, storage: storage) : nil)
+                     fish: services.contains(.fish) ? KeychainStore.load(for: .fish, storage: storage) : nil,
+                     gemini: services.contains(.gemini) ? KeychainStore.load(for: .gemini, storage: storage) : nil)
              }.value
          }) {
         self.clipPlayer = clipPlayer ?? VoicePreviewPlayer(); self.previewDeviceList = previewDeviceList
@@ -157,20 +235,29 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
     }
 
     var voiceLanguages: [TranslationLanguage] {
-        voiceProvider == .elevenLabs ? TranslationLanguage.elevenLabsOutputs : TranslationLanguage.composedOutputs
+        switch voiceProvider {
+        case .elevenLabs: return TranslationLanguage.elevenLabsOutputs
+        case .fish, .gemini: return TranslationLanguage.composedOutputs
+        case .system:
+            let installed = Set(voices.compactMap(\.language))
+            return TranslationLanguage.composedOutputs.filter { installed.contains($0.code) }
+        }
     }
-    var readyVoices: [ProviderVoice] { voices.filter(\.isReady) }
+    /// Account voices speak any language; a system voice speaks its own.
+    var readyVoices: [ProviderVoice] { voices.filter { $0.isReady && ($0.language == nil || $0.language == voiceLanguage) } }
     private var recordingSignature: String {
         "\(recordingService.rawValue)/\(sourceLanguage)/\(recordingService == .elevenLabs && diarize)"
     }
     var recordingNeedsRefresh: Bool {
         recording != nil && (recordingAttemptIncomplete || completedRecordingSignature != recordingSignature)
     }
-    var voiceAccount: ProviderService { voiceProvider == .elevenLabs ? .elevenLabs : .fish }
+    var voiceAccount: ProviderService? { voiceProvider.account }
+    var voiceKeyMissing: Bool { voiceAccount.map(missingKeys.contains) ?? false }
+    private var voiceAccounts: Set<ProviderService> { voiceAccount.map { [$0] } ?? [] }
     var canGenerate: Bool {
         !busy && !voiceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         && voiceText.count <= SpeechToolsLimits.voiceCharacters && voiceText.utf8.count <= 8_000
-        && (voiceProvider == .fish || !voiceID.isEmpty)
+        && (voiceProvider != .elevenLabs || !voiceID.isEmpty)
     }
     var canMakeNotes: Bool {
         !busy && !notesInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -185,7 +272,7 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
             clearNotice()
         }
         lastCredentialVersion = version
-        let presence = [ProviderService.openAI, .elevenLabs, .fish].map { ($0, keyPresence($0)) }
+        let presence = [ProviderService.openAI, .elevenLabs, .fish, .gemini].map { ($0, keyPresence($0)) }
         missingKeys = Set(presence.filter { $0.1 == false }.map(\.0))
         if !didCheckKeys {
             if missingKeys.contains(.elevenLabs), presence.contains(where: { $0.0 == .openAI && $0.1 == true }) { recordingService = .openAI }
@@ -278,16 +365,16 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
     var canDub: Bool {
         guard !busy, let recording, recording.targetLanguage != nil, audioSource != nil else { return false }
         let translated = recording.segments.filter { $0.translatedText != nil }
-        return !translated.isEmpty && translated.allSatisfy { $0.startSeconds != nil } && (voiceProvider == .fish || !voiceID.isEmpty)
+        return !translated.isEmpty && translated.allSatisfy { $0.startSeconds != nil } && (voiceProvider != .elevenLabs || !voiceID.isEmpty)
     }
     var dubCharacters: Int { recording?.segments.reduce(0) { $0 + ($1.translatedText?.count ?? 0) } ?? 0 }
     func createDub() {
         refreshKeyPresence()
         guard canDub, let recording, let audio = audioSource else { return }
-        let route: TranslationRoute = voiceProvider == .elevenLabs ? .elevenLabs : .fish
+        let route = voiceProvider.route
         let voice = voiceID.isEmpty ? nil : voiceID, direction = SpeechDirection(delivery: voiceDelivery, speed: voiceSpeed)
         let includeOriginal = dubIncludesOriginal
-        perform("Dubbing…", services: [voiceAccount]) { model, keys in
+        perform("Dubbing…", services: voiceAccounts) { model, keys in
             let data = try await model.service.dub(transcript: recording, source: audio, includeOriginal: includeOriginal, originalLevel: 0.25,
                                                    voiceID: voice, route: route, direction: direction, credentials: keys)
             try model.checkCurrentOperation()
@@ -314,8 +401,10 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
     }
     func refreshVoices() {
         refreshKeyPresence()
-        let provider = voiceProvider
-        perform("Loading voices…", services: [voiceAccount]) { model, keys in
+        guard let provider = voiceProvider.accountVoices else {
+            voices = voiceProvider.localVoices; voicesLoaded = true; return
+        }
+        perform("Loading voices…", services: voiceAccounts) { model, keys in
             let voices = try await model.voiceService.list(provider: provider, credentials: keys)
             try model.checkCurrentOperation(); model.voices = voices; model.voicesLoaded = true
             if !voices.contains(where: { $0.id == model.voiceID && $0.isReady }) { model.voiceID = "" }
@@ -328,15 +417,15 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
         if voiceSource == .recording { revoiceRecording(); return }
         guard canGenerate else { return }
         let text = voiceText, language = voiceLanguage, voice = voiceID.isEmpty ? nil : voiceID
-        let route: TranslationRoute = voiceProvider == .elevenLabs ? .elevenLabs : .fish
+        let route = voiceProvider.route
         let direction = SpeechDirection(delivery: voiceDelivery, speed: voiceSpeed)
-        perform("Generating voice clip…", services: [voiceAccount]) { model, keys in
+        perform("Generating voice clip…", services: voiceAccounts) { model, keys in
             let data = try await model.service.voiceClip(text: text, language: language, voiceID: voice, route: route,
                                                          direction: direction, credentials: keys)
             try model.checkCurrentOperation()
             guard model.voiceText == text, model.voiceLanguage == language,
                   (model.voiceID.isEmpty ? nil : model.voiceID) == voice,
-                  (model.voiceProvider == .elevenLabs ? TranslationRoute.elevenLabs : .fish) == route else { throw CancellationError() }
+                  model.voiceProvider.route == route else { throw CancellationError() }
             model.addTake(data, direction: direction)
         }
     }
@@ -439,6 +528,16 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
     /// Inserts an audio tag such as [whispers] at the end of the text.
     func appendTag(_ tag: String) {
         voiceText += (voiceText.isEmpty || voiceText.hasSuffix(" ") ? "" : " ") + tag + " "
+    }
+    /// Replaces `range` with the tag, with a space on each side where the text has none.
+    /// Returns where the cursor goes: after the tag.
+    func insertTag(_ tag: String, replacing range: Range<String.Index>) -> String.Index {
+        let before = range.lowerBound == voiceText.startIndex || voiceText[voiceText.index(before: range.lowerBound)].isWhitespace ? "" : " "
+        let after = range.upperBound < voiceText.endIndex && voiceText[range.upperBound].isWhitespace ? "" : " "
+        let inserted = before + tag + after
+        let offset = voiceText.distance(from: voiceText.startIndex, to: range.lowerBound) + inserted.count
+        voiceText.replaceSubrange(range, with: inserted)
+        return voiceText.index(voiceText.startIndex, offsetBy: offset)
     }
     private func clearTakes() { takes = []; selectedTakeID = nil }
     private func addTake(_ audio: Data, direction: SpeechDirection) {

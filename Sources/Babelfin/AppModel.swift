@@ -29,32 +29,18 @@ private final class CaptureAdmission: @unchecked Sendable {
     @Published var destination: AudioDestination = .teams { didSet { destinationChanged(from: oldValue) } }
     @Published var inputUID = "" { didSet { inputChanged(from: oldValue) } }
     @Published var outputUID = "" { didSet { outputChanged(from: oldValue) } }
-    @Published var targetLanguage = "en" { didSet {
-        guard !applyingPreferences else { return }
-        if configurationLocked { applyingPreferences = true; targetLanguage = oldValue; applyingPreferences = false; return }
-        savedPreferences.targetLanguage = targetLanguage; persistPreferences()
-        settingChanged(.outputLanguage)
-    } }
+    @Published var targetLanguage = "en" { didSet { lockedSettingChanged(\.targetLanguage, from: oldValue, .outputLanguage) { $0.targetLanguage = self.targetLanguage } } }
     @Published var route: TranslationRoute = .openAI { didSet {
         guard !applyingPreferences else { return }
         if configurationLocked { applyingPreferences = true; route = oldValue; applyingPreferences = false; return }
         savedPreferences.providerRoute = route.rawValue
-        applyingPreferences = true; voiceID = savedPreferences.voices[route.rawValue] ?? ""; applyingPreferences = false
+        applyingPreferences = true; voiceID = savedPreferences.voices[route.rawValue] ?? ""
+        speakerVoices = savedPreferences.speakerVoices[route.rawValue] ?? []; applyingPreferences = false
         persistPreferences()
         settingChanged(.service)
     } }
-    @Published var sourceLanguage = "" { didSet {
-        guard !applyingPreferences else { return }
-        if configurationLocked { applyingPreferences = true; sourceLanguage = oldValue; applyingPreferences = false; return }
-        savedPreferences.sourceLanguage = sourceLanguage; persistPreferences()
-        settingChanged(.inputLanguage)
-    } }
-    @Published var pacing: TranslationPacing = .balanced { didSet {
-        guard !applyingPreferences else { return }
-        if configurationLocked { applyingPreferences = true; pacing = oldValue; applyingPreferences = false; return }
-        savedPreferences.pacing = pacing.rawValue; persistPreferences()
-        settingChanged(.delay)
-    } }
+    @Published var sourceLanguage = "" { didSet { lockedSettingChanged(\.sourceLanguage, from: oldValue, .inputLanguage) { $0.sourceLanguage = self.sourceLanguage } } }
+    @Published var pacing: TranslationPacing = .balanced { didSet { lockedSettingChanged(\.pacing, from: oldValue, .delay) { $0.pacing = self.pacing.rawValue } } }
     /// The direction's output volume. It never locks: it applies at once, also during translation.
     @Published var outputVolume = 1.0 { didSet {
         guard !applyingPreferences else { return }
@@ -65,18 +51,17 @@ private final class CaptureAdmission: @unchecked Sendable {
     } }
     /// Off: the direction translates to text only (subtitles and transcript), and the original
     /// audio plays at full volume instead of a translated voice.
-    @Published var speakTranslation = true { didSet {
-        guard !applyingPreferences else { return }
-        if configurationLocked { applyingPreferences = true; speakTranslation = oldValue; applyingPreferences = false; return }
-        savedPreferences.speakTranslation = speakTranslation; persistPreferences()
-        settingChanged(.speech)
+    @Published var speakTranslation = true { didSet { lockedSettingChanged(\.speakTranslation, from: oldValue, .speech) { $0.speakTranslation = self.speakTranslation } } }
+    @Published var voiceID = "" { didSet { lockedSettingChanged(\.voiceID, from: oldValue, .voice) { $0.voices[self.route.rawValue] = self.voiceID } } }
+    /// Voices for Speaker 1, 2, … on a route that labels speakers. Empty turns labels off.
+    @Published var speakerVoices: [String] = [] { didSet {
+        lockedSettingChanged(\.speakerVoices, from: oldValue, .voice) { $0.speakerVoices[self.route.rawValue] = self.speakerVoices }
     } }
-    @Published var voiceID = "" { didSet {
-        guard !applyingPreferences else { return }
-        if configurationLocked { applyingPreferences = true; voiceID = oldValue; applyingPreferences = false; return }
-        savedPreferences.voices[route.rawValue] = voiceID; persistPreferences()
-        settingChanged(.voice)
-    } }
+    /// The speaker voices that apply: only on a route that labels speakers, and only while speaking the translation.
+    var activeSpeakerVoices: [String] {
+        guard route.descriptor.liveSpeakerLabels, speakTranslation else { return [] }
+        return Array(speakerVoices.filter { !$0.isEmpty }.prefix(TranslationConfiguration.maximumSpeakerVoices))
+    }
     var onTranscriptEvent: ((UUID, TranslationEvent) -> Void)?
     var onTranscriptSession: ((UUID, Bool, String?) -> Void)?
     private var recordedSessionID: UUID?
@@ -86,7 +71,6 @@ private final class CaptureAdmission: @unchecked Sendable {
         savedPreferences.transcriptVisible = transcriptVisible; persistPreferences()
     } }
     @Published private(set) var transcriptLanguageName = "English"
-    @Published private(set) var keySaved: Bool?
     @Published private(set) var microphoneArmed = false
     @Published private(set) var muted = false
     @Published private(set) var consumerActive = false
@@ -143,9 +127,11 @@ private final class CaptureAdmission: @unchecked Sendable {
     @Published private(set) var level: Float = 0
     /// Stage times of the latest recognized passages in a composed route, newest last.
     @Published private(set) var passageTimings: [PassageTiming] = []
+    #if BABELFIN_SCREENSHOTS
+    func seedDemoTimings(_ timings: [PassageTiming]) { passageTimings = timings }
+    #endif
     @Published private(set) var checkingAPI = false
-    @Published var keyDraft = ""
-    @Published var keyNotice = "Manage service keys and storage in Settings → Accounts."
+    @Published var keyNotice = ""
     private var audio: (any AudioPipelineControlling)?
     private var provider: (any TranslationProvider)?
     private var generation = UUID()
@@ -166,7 +152,6 @@ private final class CaptureAdmission: @unchecked Sendable {
     private let requestPermission: @MainActor () async -> Bool
     @Published private(set) var accountPresence: [ProviderService: Bool] = [:]
     private let serviceKeyPresence: @MainActor (ProviderService) -> Bool?
-    private let keyPresence: @MainActor () -> Bool?
     private let preferencesStore: any AppPreferencesStoring
     private var savedPreferences = AppPreferences()
     private var applyingPreferences = false
@@ -239,14 +224,13 @@ private final class CaptureAdmission: @unchecked Sendable {
             return $0.isPhysical && $0.outputChannels > 0
         }
     }
-    convenience init() { self.init(providerFactory: { OpenAITranslationProvider() }, preferences: UserDefaultsAppPreferences(), keyPresence: { KeychainStore.containsSavedKey() }, serviceKeyPresence: { KeychainStore.containsSavedKey(for: $0) }, consumerFactory: { CoreAudioConsumerMonitor() }, providerResolver: { ProviderFactory.make($0) }, loadProviderCredentials: { try KeychainStore.credentials(for: $0) }, inventory: .shared, playsLoopbackOriginal: AppModel.microphoneAuthorized) }
+    convenience init() { self.init(providerFactory: { OpenAITranslationProvider() }, preferences: UserDefaultsAppPreferences(), serviceKeyPresence: { KeychainStore.containsSavedKey(for: $0) }, consumerFactory: { CoreAudioConsumerMonitor() }, providerResolver: { ProviderFactory.make($0) }, loadProviderCredentials: { try KeychainStore.credentials(for: $0) }, inventory: .shared, playsLoopbackOriginal: AppModel.microphoneAuthorized) }
     init(providerFactory: @escaping @MainActor () -> any TranslationProvider,
          audioFactory: @escaping @MainActor () -> any AudioPipelineControlling = { AudioPipeline() },
          deviceList: @escaping @MainActor () -> [AudioDevice] = { AudioDevices.cached() },
          loadKey: @escaping @MainActor () throws -> String = { try KeychainStore.load() },
          requestPermission: @escaping @MainActor () async -> Bool = { await AppModel.microphonePermission() },
          preferences: (any AppPreferencesStoring)? = nil,
-         keyPresence: @escaping @MainActor () -> Bool? = { nil },
          serviceKeyPresence: @escaping @MainActor (ProviderService) -> Bool? = { _ in nil },
          consumerFactory: (@MainActor () -> any ConsumerMonitoring)? = nil,
          providerResolver: (@MainActor (TranslationRoute) -> any TranslationProvider)? = nil,
@@ -269,7 +253,6 @@ private final class CaptureAdmission: @unchecked Sendable {
         self.deviceList = deviceList
         self.loadKey = loadKey
         self.requestPermission = requestPermission
-        self.keyPresence = keyPresence
         self.serviceKeyPresence = serviceKeyPresence
         self.consumerFactory = consumerFactory
         self.preferencesStore = preferences ?? MemoryAppPreferences()
@@ -281,6 +264,7 @@ private final class CaptureAdmission: @unchecked Sendable {
         pacing = TranslationPacing(rawValue: savedPreferences.pacing) ?? .balanced
         speakTranslation = savedPreferences.speakTranslation
         voiceID = savedPreferences.voices[route.rawValue] ?? ""
+        speakerVoices = savedPreferences.speakerVoices[route.rawValue] ?? []
         targetLanguage = savedPreferences.targetLanguage
         muted = savedPreferences.explicitlyMuted && !savedPreferences.explicitlyOff
         bypass = !savedPreferences.translationIntent
@@ -305,6 +289,14 @@ private final class CaptureAdmission: @unchecked Sendable {
         playLoopbackOriginalIfIdle()
     }
     private func persistPreferences() { preferencesStore.save(savedPreferences) }
+    /// Saves a setting and applies it, or restores `oldValue` while a session starts or stops.
+    private func lockedSettingChanged<Value>(_ keyPath: ReferenceWritableKeyPath<AppModel, Value>, from oldValue: Value,
+                                             _ setting: PendingSetting, save: (inout AppPreferences) -> Void) {
+        guard !applyingPreferences else { return }
+        if configurationLocked { applyingPreferences = true; self[keyPath: keyPath] = oldValue; applyingPreferences = false; return }
+        save(&savedPreferences); persistPreferences()
+        settingChanged(setting)
+    }
     private func destinationChanged(from oldValue: AudioDestination) {
         guard !applyingPreferences else { return }
         if configurationLocked {
@@ -390,7 +382,8 @@ private final class CaptureAdmission: @unchecked Sendable {
     private func currentTranslationConfiguration() -> TranslationConfiguration {
         .init(targetLanguage: targetLanguage, noiseReduction: sessionConfiguration?.input.isPhysical == true ? .nearField : .disabled,
               route: route, sourceLanguage: !route.descriptor.acceptsLanguageHint || sourceLanguage.isEmpty ? nil : sourceLanguage,
-              voiceID: route.descriptor.isDirect || voiceID.isEmpty ? nil : voiceID, pacing: pacing, speaksTranslation: speakTranslation)
+              voiceID: route.descriptor.isDirect || voiceID.isEmpty ? nil : voiceID, pacing: pacing, speaksTranslation: speakTranslation,
+              speakerVoices: activeSpeakerVoices)
     }
     /// Applies pending settings. Without a device or speech change, original audio continues while
     /// the new session connects; otherwise the audio restarts on the new devices.
@@ -418,7 +411,6 @@ private final class CaptureAdmission: @unchecked Sendable {
         }
     }
     func refreshKeyStatus() {
-        keySaved = keyPresence()
         accountPresence = Dictionary(uniqueKeysWithValues: ProviderService.allCases.compactMap { service in
             serviceKeyPresence(service).map { (service, $0) }
         })
@@ -505,7 +497,7 @@ private final class CaptureAdmission: @unchecked Sendable {
             fail("Choose a supported translation language."); return
         }
         guard bypass || !capabilities.requiresVoiceID || !voiceID.isEmpty else { fail("Choose a voice in Settings first."); return }
-        let configuration = AppSessionConfiguration(destination: destination, input: input, output: output, targetLanguage: targetLanguage, route: route, sourceLanguage: !route.descriptor.acceptsLanguageHint || sourceLanguage.isEmpty ? nil : sourceLanguage, voiceID: route.descriptor.isDirect || voiceID.isEmpty ? nil : voiceID, pacing: pacing, speaksTranslation: speakTranslation, originalAudio: bypass, originalMixEnabled: originalMixEnabled, originalMixLevel: originalMixLevel, originalMixDucking: originalMixDucking)
+        let configuration = AppSessionConfiguration(destination: destination, input: input, output: output, targetLanguage: targetLanguage, route: route, sourceLanguage: !route.descriptor.acceptsLanguageHint || sourceLanguage.isEmpty ? nil : sourceLanguage, voiceID: route.descriptor.isDirect || voiceID.isEmpty ? nil : voiceID, pacing: pacing, speaksTranslation: speakTranslation, originalAudio: bypass, originalMixEnabled: originalMixEnabled, originalMixLevel: originalMixLevel, originalMixDucking: originalMixDucking, speakerVoices: activeSpeakerVoices)
         sessionConfiguration = configuration
         source = ""; translation = ""; segmentTexts = [:]; segmentOrder = []
         transcriptLanguageName = configuration.targetLanguageName
@@ -532,7 +524,7 @@ private final class CaptureAdmission: @unchecked Sendable {
                     await self.handle(event, sessionID: token)
                 }
                 do {
-                    try await provider.start(configuration: .init(targetLanguage: configuration.targetLanguage, noiseReduction: configuration.input.isPhysical ? .nearField : .disabled, route: configuration.route, sourceLanguage: configuration.sourceLanguage, voiceID: configuration.voiceID, pacing: configuration.pacing, speaksTranslation: configuration.speaksTranslation), credentials: credentials)
+                    try await provider.start(configuration: .init(targetLanguage: configuration.targetLanguage, noiseReduction: configuration.input.isPhysical ? .nearField : .disabled, route: configuration.route, sourceLanguage: configuration.sourceLanguage, voiceID: configuration.voiceID, pacing: configuration.pacing, speaksTranslation: configuration.speaksTranslation, speakerVoices: configuration.speakerVoices), credentials: credentials)
                 } catch {
                     guard generation == token else { return }
                     diagnoseKeys(configuration.route)
@@ -1013,36 +1005,32 @@ private final class CaptureAdmission: @unchecked Sendable {
         guard !configurationLocked else { return }
         checkingAPI = true
         defer { checkingAPI = false }
-        keyNotice = "Checking the API with generated silence…"
-        let check = providerFactory()
+        keyNotice = "Checking \(route.displayName) with generated silence…"
+        // The direction's own route and keys; checks without a resolver use the OpenAI provider.
+        let check = providerResolver?(route) ?? providerFactory()
         var failureCode: String?
         check.onEvent = { event in
             if case .failure(let code) = event { failureCode = code }
         }
         do {
-            let key = try loadKey()
-            try await check.start(configuration: .init(), apiKey: key)
+            if providerResolver != nil, let loadProviderCredentials {
+                try await check.start(configuration: currentTranslationConfiguration(), credentials: try loadProviderCredentials(route))
+            } else {
+                try await check.start(configuration: .init(), apiKey: try loadKey())
+            }
             for _ in 0..<10 {
                 try check.append(Data(repeating: 0, count: 4800))
                 try await Task.sleep(nanoseconds: 100_000_000)
             }
             await check.finish()
             if let code = failureCode { throw BridgeError.unavailable("API check failed (\(code)).") }
-            keyNotice = "API connection verified: configured, streamed silence, and closed. Speech translation is still untested."
+            keyNotice = "\(route.displayName) works: Babelfin connected, sent silence and closed. This check does not test translation."
             log("API connection check passed using generated silence. No microphone audio was captured.")
         } catch {
             check.cancel()
             keyNotice = error.localizedDescription
             log("API connection check failed. Check the key notice in Settings.")
         }
-    }
-    func saveKey(_ value: String) {
-        do { try KeychainStore.save(value); keySaved = true; keyNotice = "API key saved in the selected storage." }
-        catch { keyNotice = error.localizedDescription }
-    }
-    func deleteKey() {
-        do { try KeychainStore.delete(); keySaved = false; keyNotice = "API key removed from the selected storage." }
-        catch { keyNotice = error.localizedDescription }
     }
     func clearTranscript() { source = ""; translation = ""; segmentTexts = [:]; segmentOrder = [] }
     func clearDiagnostics() { logs = [] }

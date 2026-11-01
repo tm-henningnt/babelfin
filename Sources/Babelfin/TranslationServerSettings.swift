@@ -61,7 +61,7 @@ struct TranslationServerSection: View {
             }
             if !state.notice.isEmpty { Text(state.notice).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
         } header: { Text("Translation server (optional)") } footer: {
-            Text("An OpenAI-compatible server, for example Ollama or LM Studio, can translate the text for the ElevenLabs and Fish Audio routes. Babelfin sends the recognized text to this server. Plain HTTP is allowed only for this Mac and .local hosts. After you save, choose a service “with your translation server”.")
+            Text("An OpenAI-compatible server such as Ollama or LM Studio translates the text for the ElevenLabs and Fish Audio routes. Plain HTTP works only for this Mac and .local hosts.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }

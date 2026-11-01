@@ -4,7 +4,6 @@ import SwiftUI
 struct AboutView: View {
     var artwork: NSImage = Bundle.main.url(forResource: "BrandFish", withExtension: "png").flatMap { NSImage(contentsOf: $0) }
         ?? NSImage(named: NSImage.applicationIconName) ?? NSImage()
-    @Environment(\.dismiss) private var dismiss
     private var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development" }
     private var build: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—" }
     var body: some View {
@@ -20,10 +19,7 @@ struct AboutView: View {
                 .fixedSize(horizontal: false, vertical: true).padding(.top, 12)
             Text("By Henning Naarlien-Tolpinrud")
                 .font(.callout).foregroundStyle(.secondary).padding(.top, 16).textSelection(.enabled)
-            HStack(spacing: 10) {
-                Button("How to use") { AppLinks.openHelp() }
-                Button("Check for Updates…") { UpdatesWindow.show(beforeQuit: {}) }
-            }.buttonStyle(.bordered).padding(.top, 22)
+            Button("Check for Updates…") { UpdatesWindow.show(beforeQuit: {}) }.buttonStyle(.bordered).padding(.top, 22)
             HStack(spacing: 20) {
                 Link("Babelfin website", destination: AppLinks.website)
                 Link("Source on GitHub", destination: AppLinks.repository)
@@ -36,7 +32,6 @@ struct AboutView: View {
                     Text("Source-available under the Sustainable Use License")
                 }.font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
             }
         }
         .padding(32).frame(width: 460)

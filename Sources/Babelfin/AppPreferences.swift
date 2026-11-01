@@ -21,6 +21,8 @@ struct AppPreferences: Codable, Equatable {
     var pacing = TranslationPacing.balanced.rawValue
     var speakTranslation = true
     var voices: [String: String] = [:]
+    /// Voices for Speaker 1, 2, … per route. Empty or missing turns speaker labels off.
+    var speakerVoices: [String: [String]] = [:]
     var readyForCalls = false
     var explicitlyMuted = false
     var explicitlyOff = true
@@ -31,7 +33,7 @@ struct AppPreferences: Codable, Equatable {
     var originalMixDucking = true
     var outputVolume = 1.0
     private enum CodingKeys: String, CodingKey {
-        case destination, teams, teamsOutputConfigured, listen, listenInputConfigured, targetLanguage, transcriptVisible, providerRoute, sourceLanguage, pacing, speakTranslation, voices
+        case destination, teams, teamsOutputConfigured, listen, listenInputConfigured, targetLanguage, transcriptVisible, providerRoute, sourceLanguage, pacing, speakTranslation, voices, speakerVoices
         case originalMixEnabled, originalMixLevel, originalMixDucking, outputVolume
         case explicitlyMuted, explicitlyOff, translationIntent, readyForCalls
     }
@@ -49,6 +51,7 @@ struct AppPreferences: Codable, Equatable {
         pacing = try values.decodeIfPresent(String.self, forKey: .pacing) ?? TranslationPacing.balanced.rawValue
         speakTranslation = try values.decodeIfPresent(Bool.self, forKey: .speakTranslation) ?? true
         voices = try values.decodeIfPresent([String: String].self, forKey: .voices) ?? [:]
+        speakerVoices = try values.decodeIfPresent([String: [String]].self, forKey: .speakerVoices) ?? [:]
         readyForCalls = try values.decodeIfPresent(Bool.self, forKey: .readyForCalls) ?? false
         explicitlyMuted = try values.decodeIfPresent(Bool.self, forKey: .explicitlyMuted) ?? false
         explicitlyOff = try values.decodeIfPresent(Bool.self, forKey: .explicitlyOff) ?? true
@@ -104,5 +107,6 @@ struct AppSessionConfiguration {
     let originalMixEnabled: Bool
     let originalMixLevel: Double
     let originalMixDucking: Bool
+    var speakerVoices: [String] = []
     var targetLanguageName: String { ProviderCapabilities.forRoute(route).outputLanguages.first { $0.code == targetLanguage }?.name ?? "Choose a language" }
 }

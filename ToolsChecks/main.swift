@@ -237,7 +237,43 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
         let fish = try body(fishHTTP.requests.get()[0])
         try expect(fish["temperature"] as? Double == 0.5 && (fish["prosody"] as? [String: Any])?["speed"] as? Double == 0.8,
                    "Steady Fish clips lower the temperature and set the speed")
+        // eleven_v4_turbo ignores speed, so a Steady or Natural clip is stretched locally.
+        let speech = PCM16.encode((0..<48_000).map { Float(sin(Double($0) * 0.05) * 0.3) })
+        let slow = try await SpeechToolsService(transport: FakeHTTP([speech])).voiceClip(text: "A clip.", language: "en", voiceID: "fixture",
+            route: .elevenLabs, direction: SpeechDirection(delivery: .natural, speed: 0.8), credentials: .init(elevenLabs: "synthetic-key"))
+        let steady = try await SpeechToolsService(transport: FakeHTTP([speech])).voiceClip(text: "A clip.", language: "en", voiceID: "fixture",
+            route: .elevenLabs, direction: SpeechDirection(delivery: .natural), credentials: .init(elevenLabs: "synthetic-key"))
+        let fast = try await SpeechToolsService(transport: FakeHTTP([speech])).voiceClip(text: "A clip.", language: "en", voiceID: "fixture",
+            route: .elevenLabs, direction: expressive, credentials: .init(elevenLabs: "synthetic-key"))
+        // The clips are WAV files: the same 44-byte header on each.
+        try expect(Double(slow.count - 44) > Double(speech.count) * 1.15 && steady.count == speech.count + 44 && fast.count == speech.count + 44,
+                   "A slower Natural ElevenLabs clip is longer; normal speed and v3 clips pass through: \(slow.count) \(steady.count) \(fast.count)")
         print("PASS: directed voice clips set the model, delivery and speed")
+        func interaction(_ pcm: Data, rate: Int = 24_000) throws -> Data {
+            try json(["status": "completed", "steps": [["type": "model_output", "content": [[
+                "type": "audio", "data": pcm.base64EncodedString(), "sample_rate": rate, "channels": 1,
+                "mime_type": "audio/l16; rate=\(rate); channels=1"]]]]])
+        }
+        let geminiHTTP = FakeHTTP([try interaction(speech)])
+        let gemini = try await SpeechToolsService(transport: geminiHTTP).voiceClip(text: "A clip.", language: "no", voiceID: nil, route: .gemini,
+            direction: SpeechDirection(delivery: .natural, speed: 0.8), credentials: .init(gemini: "synthetic-key"))
+        let geminiRequest = geminiHTTP.requests.get()[0], geminiBody = try body(geminiRequest)
+        let speechConfig = (geminiBody["generation_config"] as? [String: Any])?["speech_config"] as? [[String: Any]]
+        try expect(geminiRequest.url?.path == "/v1beta/interactions" && geminiBody["model"] as? String == "gemini-3.8-flash-tts"
+                   && speechConfig?.first?["voice"] as? String == "Kore" && geminiRequest.value(forHTTPHeaderField: "x-goog-api-key") == "synthetic-key"
+                   && Double(gemini.count - 44) > Double(speech.count) * 1.15,
+                   "Gemini clips use the default voice, the API key header and a local stretch for speed")
+        for bad in [try interaction(pcm, rate: 16_000), try json(["status": "in_progress", "steps": []])] {
+            do { _ = try await SpeechToolsService(transport: FakeHTTP([bad])).voiceClip(text: "A clip.", language: "en", voiceID: "Puck",
+                     route: .gemini, credentials: .init(gemini: "synthetic-key")); throw CheckFailure(message: "Unexpected Gemini audio accepted") }
+            catch let failure as CheckFailure { throw failure } catch { }
+        }
+        let unknownVoice = FakeHTTP()
+        do { _ = try await SpeechToolsService(transport: unknownVoice).voiceClip(text: "A clip.", language: "en", voiceID: "Nobody",
+                 route: .gemini, credentials: .init(gemini: "synthetic-key")); throw CheckFailure(message: "Unknown Gemini voice accepted") }
+        catch let failure as CheckFailure { throw failure } catch { }
+        try expect(unknownVoice.requests.get().isEmpty, "An unknown Gemini voice reached the network")
+        print("PASS: Gemini voice clips send the chosen voice and refuse other audio formats")
         let changerHTTP = FakeHTTP([pcm])
         let revoiced = try await SpeechToolsService(transport: changerHTTP).revoice(
             wav: try SpeechToolsWAV.encode(pcm: pcm), voiceID: "fixture", delivery: .steady, credentials: .init(elevenLabs: "synthetic-key"))

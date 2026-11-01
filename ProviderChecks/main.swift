@@ -273,6 +273,21 @@ final class FakeSocket: TranslationWebSocket, @unchecked Sendable {
                 clock.advance(6)
                 try await eventually("Watchdog did not fire") { events.failures.contains("received_audio_stale") }
                 gate.release()
+            }),
+            ("Expired session fails and closes the transport", {
+                let socket = FakeSocket(), wall = Clock()
+                let provider = OpenAITranslationProvider(transportFactory: { _ in socket }, wallClock: { wall.read() })
+                let events = Events()
+                provider.onEvent = { events.accept($0) }
+                try await provider.start(configuration: .init(), apiKey: "fixture")
+                socket.emit(["type": "session.created", "session": ["expires_at": Int(wall.read()) + 30]])
+                try provider.append(Data([0, 0]))
+                try await Task.sleep(nanoseconds: 600_000_000)
+                try require(events.failures.isEmpty && !socket.isCancelled, "A live session expired early")
+                wall.advance(31)
+                try await eventually("Expiry did not fire") { events.failures.contains("session_expired") }
+                try require(socket.isCancelled, "Expired session left the transport open")
+                try rejects { try provider.append(Data([0, 0])) }
             })
         ]
         var failures = 0

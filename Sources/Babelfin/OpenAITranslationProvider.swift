@@ -124,6 +124,8 @@ typealias OpenAITranslationProvider = RealtimeTranslationProvider
     private let wire: any RealtimeTranslationWire
     private let makeSocket: @Sendable (String) -> any TranslationWebSocket
     private let now: @Sendable () -> TimeInterval
+    /// Seconds since 1970, the clock of the session's `expires_at`.
+    private let wallClock: @Sendable () -> TimeInterval
     private var socket: (any TranslationWebSocket)?
     private var reader: Task<Void, Never>?
     private var sender: Task<Void, Never>?
@@ -146,10 +148,11 @@ typealias OpenAITranslationProvider = RealtimeTranslationProvider
 
     init(wire: any RealtimeTranslationWire = OpenAIRealtimeWire(),
          transportFactory: (@Sendable (String) -> any TranslationWebSocket)? = nil,
-         clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         wallClock: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }) {
         self.wire = wire
         makeSocket = transportFactory ?? { [wire] in URLTranslationWebSocket(request: wire.request(credential: $0)) }
-        now = clock
+        now = clock; self.wallClock = wallClock
     }
 
     func start(configuration: TranslationConfiguration, credentials: ProviderCredentials) async throws {
@@ -317,7 +320,7 @@ typealias OpenAITranslationProvider = RealtimeTranslationProvider
             await fail(input.oldestAge > 5 ? "audio_upload_stale" : "received_audio_stale", token: token); return
         }
         if let expiresAt {
-            let remaining = expiresAt - Date().timeIntervalSince1970
+            let remaining = expiresAt - wallClock()
             if remaining <= 0 { await fail("session_expired", token: token); return }
             if remaining <= 60, !warnedExpiration {
                 warnedExpiration = true

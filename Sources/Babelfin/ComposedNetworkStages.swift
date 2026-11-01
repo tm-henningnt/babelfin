@@ -111,15 +111,25 @@ enum TranslationInstructions {
         ], header: "xi-api-key", credential: try credentials.require(.elevenLabs))
         try await stream(request, onAudio: onAudio)
     }
-    /// eleven_v3 performs audio tags such as [whispers].
+    /// eleven_v3 performs audio tags such as [whispers] and applies the speed. eleven_v4_turbo
+    /// ignores `speed` (probe 2026-11-01: the same length at 0.7 and 1.2), so the stage stretches its audio.
     func synthesize(text: String, language: String, voiceID: String?, direction: SpeechDirection,
                     credentials: ProviderCredentials, onAudio: @escaping TranslationAudioHandler) async throws {
         let voiceID = try validate(text: text, language: language, voiceID: voiceID)
+        let expressive = direction.delivery == .expressive
         let request = try providerJSONRequest(URL(string: "https://api.elevenlabs.io/v1/text-to-speech/\(voiceID)?output_format=pcm_24000")!, body: [
-            "text": text, "model_id": direction.delivery == .expressive ? "eleven_v3" : "eleven_v4_turbo", "language_code": language,
+            "text": text, "model_id": expressive ? "eleven_v3" : "eleven_v4_turbo", "language_code": language,
             "voice_settings": ["stability": direction.delivery.elevenLabsStability, "speed": direction.speed]
         ], header: "xi-api-key", credential: try credentials.require(.elevenLabs))
-        try await stream(request, onAudio: onAudio)
+        guard !expressive, direction.speed != 1 else { try await stream(request, onAudio: onAudio); return }
+        let stretcher = SpeechRateStretcher(range: SpeechDirection.speeds)
+        stretcher.setRate(direction.speed)
+        try await stream(request) { chunk in
+            let stretched = try stretcher.process(chunk)
+            if !stretched.isEmpty { try await onAudio(stretched) }
+        }
+        let tail = stretcher.finish()
+        if !tail.isEmpty { try await onAudio(tail) }
     }
     func cancel() { operations.forEach { $0.cancel() }; transport.cancel() }
     private func validate(text: String, language: String, voiceID: String?) throws -> String {
@@ -173,6 +183,72 @@ enum TranslationInstructions {
                                              header: "Authorization", credential: "Bearer \(try credentials.require(.fish))")
         request.setValue("s2.1-pro", forHTTPHeaderField: "model")
         try await streamProviderPCM(transport: transport, request: request, token: token, sink: onAudio)
+    }
+}
+
+/// Gemini speech generation through the Interactions API. One request returns the whole clip
+/// as base64 PCM16 (probe 2026-11-01: mono 24 kHz, little-endian). Gemini has no speed setting,
+/// so the stage stretches the audio.
+/// https://ai.google.dev/gemini-api/docs/speech-generation
+@MainActor final class GeminiSpeechSynthesisStage: SpeechSynthesisStage {
+    static let model = "gemini-3.8-flash-tts"
+    static let defaultVoice = "Kore"
+    /// The prebuilt voices. Gemini picks the language from the text.
+    static let voices = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Autonoe",
+                         "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi",
+                         "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird",
+                         "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"]
+    private let transport: any ProviderHTTPTransport
+    private var operation: ProviderCancellation?
+    init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport()) { self.transport = transport }
+    func synthesize(text: String, language: String, voiceID: String?, credentials: ProviderCredentials,
+                    onAudio: @escaping TranslationAudioHandler) async throws {
+        try await synthesize(text: text, language: language, voiceID: voiceID, direction: .standard,
+                             credentials: credentials, onAudio: onAudio)
+    }
+    func synthesize(text: String, language: String, voiceID: String?, direction: SpeechDirection,
+                    credentials: ProviderCredentials, onAudio: @escaping TranslationAudioHandler) async throws {
+        guard operation == nil else { throw ProviderNetworkError.busy }
+        try validateProviderToken(language)
+        guard !text.isEmpty, text.count <= SpeechToolsLimits.voiceCharacters, text.utf8.count <= 8_000 else { throw ProviderNetworkError.invalidRequest }
+        let voice = voiceID.flatMap { $0.isEmpty ? nil : $0 } ?? Self.defaultVoice
+        guard Self.voices.contains(voice) else { throw ProviderNetworkError.invalidRequest }
+        let token = ProviderCancellation(); operation = token; defer { operation = nil }
+        let request = try providerJSONRequest(URL(string: "https://generativelanguage.googleapis.com/v1beta/interactions")!, body: [
+            "model": Self.model,
+            "input": [["type": "user_input", "content": [["type": "text", "text": text]]]],
+            "response_format": ["type": "audio", "mime_type": "audio/l16", "sample_rate": 24_000],
+            "generation_config": ["speech_config": [["voice": voice]]]
+        ], header: "x-goog-api-key", credential: try credentials.require(.gemini))
+        // Base64 adds a third to the PCM limit.
+        let response = try await transport.json(request, maximumBytes: SpeechToolsLimits.voicePCMBytes / 3 * 4 + 65_536)
+        try token.check(); try Task.checkCancellation()
+        let pcm = try Self.audio(in: response)
+        guard direction.speed != 1 else { try await onAudio(pcm); return }
+        let stretcher = SpeechRateStretcher(range: SpeechDirection.speeds)
+        stretcher.setRate(direction.speed)
+        let stretched = try stretcher.process(pcm) + stretcher.finish()
+        try await onAudio(stretched)
+    }
+    func cancel() { operation?.cancel(); transport.cancel() }
+
+    /// The PCM in a completed interaction. Any other format or sample rate is refused.
+    static func audio(in response: [String: Any]) throws -> Data {
+        guard response["status"] as? String == "completed", let steps = response["steps"] as? [[String: Any]] else {
+            throw ProviderNetworkError.invalidResponse
+        }
+        let parts = steps.flatMap { $0["content"] as? [[String: Any]] ?? [] }.filter { $0["type"] as? String == "audio" }
+        var pcm = Data()
+        for part in parts {
+            guard part["sample_rate"] as? Int == 24_000, (part["channels"] as? Int ?? 1) == 1,
+                  (part["mime_type"] as? String)?.hasPrefix("audio/l16") == true,
+                  let encoded = part["data"] as? String, let data = Data(base64Encoded: encoded) else {
+                throw ProviderNetworkError.invalidResponse
+            }
+            pcm.append(data)
+        }
+        guard !pcm.isEmpty, pcm.count.isMultiple(of: 2) else { throw ProviderNetworkError.invalidResponse }
+        return pcm
     }
 }
 

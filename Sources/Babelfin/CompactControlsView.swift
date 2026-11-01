@@ -157,35 +157,81 @@ struct OutputVolumeControl: View {
     }
 }
 
+enum CompactPreferences {
+    /// Open compact controls instead of the main window at launch.
+    static let atLaunch = "babelfin.compactControls.v1"
+    /// Compact controls stay above other windows.
+    static let onTop = "babelfin.compactControls.onTop"
+}
+
+/// Compact controls: a small window without a title bar, like a widget. The pin keeps it above
+/// other windows; the close button and the window background work as usual.
+struct CompactWindow: View {
+    @ObservedObject var conversation: ConversationModel
+    @Environment(\.openWindow) private var openWindow
+    @AppStorage(CompactPreferences.onTop) private var onTop = false
+    var body: some View {
+        CompactControlsView(conversation: conversation) { MainNavigation.open($0, openWindow: openWindow) }
+            .frame(width: 440)
+            .background(CompactWindowLevel(onTop: onTop))
+    }
+}
+
+/// Floats the compact window above other windows, also over full-screen apps, when the pin is on.
+private struct CompactWindowLevel: NSViewRepresentable {
+    var onTop: Bool
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        let onTop = onTop
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            window.level = onTop ? .floating : .normal
+            window.isMovableByWindowBackground = true
+            window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+            window.standardWindowButton(.zoomButton)?.isHidden = true
+            if onTop { window.collectionBehavior.insert(.fullScreenAuxiliary) } else { window.collectionBehavior.remove(.fullScreenAuxiliary) }
+        }
+    }
+}
+
 struct CompactControlsView: View {
     @ObservedObject var conversation: ConversationModel
-    var expand: () -> Void
+    var open: (MainSection) -> Void
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage(CompactPreferences.onTop) private var onTop = false
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 8) {
-                    Spacer()
-                    Button { open(.transcript) } label: { Label("Transcript", systemImage: "text.bubble") }
-                        .help("Open the transcript")
-                    Button { open(conversation.direction == .outgoing ? .outgoing : .incoming) } label: {
-                        Label("Expand", systemImage: "arrow.up.left.and.arrow.down.right")
-                    }.help("Show routes, languages, transcript and tools")
-                }.controlSize(.small)
-                CompactDirectionView(model: conversation.outgoing, incoming: false) { open(.outgoing) }
-                Divider()
-                CompactDirectionView(model: conversation.incoming, incoming: true) { open(.incoming) }
-            }
-            .padding(16)
+        VStack(alignment: .leading, spacing: 10) {
+            CompactDirectionView(model: conversation.outgoing, incoming: false) { open(.home) }
+            Divider()
+            CompactDirectionView(model: conversation.incoming, incoming: true) { open(.home) }
         }
+        .padding(.horizontal, 16).padding(.top, 2).padding(.bottom, 14)
+        // The buttons share the title bar with the close button.
+        .overlay(alignment: .topTrailing) {
+            HStack(spacing: 2) {
+                iconButton(onTop ? "pin.fill" : "pin", onTop ? "Stop keeping on top" : "Keep on top", tint: onTop) { onTop.toggle() }
+                iconButton("text.bubble", "Open the transcript") { open(.transcript) }
+                iconButton("arrow.up.left.and.arrow.down.right", "Show Home") { open(.home) }
+            }
+            .padding(.trailing, 10).padding(.top, 5)
+            .ignoresSafeArea(.container, edges: .top)
+        }
+        .modifier(NoFocusRing())
         .onAppear { refreshDevices() }
         .onChange(of: scenePhase) { if $0 == .active { refreshDevices() } }
     }
-    private func open(_ section: MainSection) { MainNavigation.shared.section = section; expand() }
+    private func iconButton(_ symbol: String, _ help: String, tint: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 12, weight: .medium))
+                .foregroundStyle(tint ? Color.accentColor : Color.secondary)
+                .frame(width: 26, height: 18).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).help(help).accessibilityLabel(help)
+    }
     private func refreshDevices() { conversation.outgoing.refresh(); conversation.incoming.refresh(); conversation.outgoing.refreshKeyStatus(); conversation.incoming.refreshKeyStatus() }
 }
 
-/// One row per direction: state on the left, the next actions on the right.
+/// One direction in two rows: state and the next action, then what you hear and the volume.
 private struct CompactDirectionView: View {
     @ObservedObject var model: AppModel
     var incoming: Bool
@@ -196,48 +242,60 @@ private struct CompactDirectionView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 Circle().fill(model.statusColor).frame(width: 8, height: 8).accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(incoming ? "Listen" : "Speak").font(.headline)
-                    Text("\(model.languageSummary) · \(model.sessionTitle)").font(.caption).foregroundStyle(.secondary)
-                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    Text("\(model.languageSummary) · \(model.sessionTitle)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityElement(children: .combine)
+                LevelMeter(level: model.level)
+                    .accessibilityLabel(incoming ? "Listen input level" : "Microphone input level")
+                    .accessibilityValue("\(Int(model.level * 100)) percent")
                 if model.phase == .starting || model.phase == .stopping { ProgressView().controlSize(.small) }
                 if model.phase == .failed || (!model.setupRequirements.isEmpty && !model.active && !model.muted) {
-                    Button(model.phase == .failed ? "Review…" : "Set up…", action: configure)
-                        .help("Show the full status and audio settings for this direction")
+                    Button(model.phase == .failed ? "Review…" : "Set Up…", action: configure)
                 } else {
-                    TranslationControls(model: model, incoming: incoming, spaced: false)
+                    Button(actions.primaryTitle) { Task { await actions.performPrimary() } }
+                        .buttonStyle(.borderedProminent).disabled(actions.primaryDisabled).help(actions.primaryHelp)
+                        .accessibilityLabel("\(incoming ? "Listen" : "Speak"): \(actions.primaryTitle)")
                 }
-                Menu {
-                    if !incoming && model.destination == .teams {
-                        Toggle("Ready for calls", isOn: Binding(get: { model.microphoneArmed }, set: { value in
-                            Task { await model.setMicrophoneArmed(value) }
-                        }))
-                        .disabled(model.phase == .stopping || model.checkingAPI || (model.active && !model.microphoneArmed))
-                    }
-                    Button("Start original audio") { Task { await actions.startOriginal() } }.disabled(actions.originalDisabled)
-                    Toggle("Show timing", isOn: $timingVisible)
-                    Button("Audio setup…", action: configure)
-                } label: { Image(systemName: "ellipsis.circle") }
-                .menuStyle(.borderlessButton).fixedSize()
-                .accessibilityLabel("\(incoming ? "Listen" : "Speak") options")
+                options
+            }
+            HStack(spacing: 10) {
+                Picker("Hear", selection: $model.hearing) {
+                    ForEach(AppModel.Hearing.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.menu).labelsHidden().fixedSize().controlSize(.small)
+                .accessibilityLabel("\(incoming ? "Listen" : "Speak"): hear")
+                Image(systemName: "speaker.fill").font(.caption).foregroundStyle(.secondary).accessibilityHidden(true)
+                Slider(value: $model.outputVolume, in: 0...1).controlSize(.small)
+                    .accessibilityLabel("\(incoming ? "Listen" : "Speak") output volume")
+                    .accessibilityValue("\(Int((model.outputVolume * 100).rounded())) percent")
             }
             if model.phase == .failed || model.requiresDeviceResume || model.translationIssue != nil {
                 Text(model.sessionNotice).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 10) {
-                ProgressView(value: Double(model.level), total: 1).controlSize(.small)
-                    .accessibilityLabel(incoming ? "Listen input level" : "Microphone input level")
-                    .accessibilityValue("\(Int(model.level * 100)) percent")
-                    .help("Input level")
-                HearingPicker(model: model, incoming: incoming).controlSize(.mini)
-                OutputVolumeControl(model: model, incoming: incoming, compact: true)
-            }
             if !model.pendingRestart.isEmpty { RestartNotice(model: model, compact: true) }
-            if timingVisible { PipelineTimingView(model: model, compact: true) }
+            if timingVisible && !model.route.descriptor.isDirect { PipelineTimingView(model: model, compact: true, showsBar: false) }
         }
+    }
+    private var options: some View {
+        Menu {
+            Button(model.muted ? "Unmute" : "Mute") { Task { await actions.toggleMute() } }.disabled(actions.muteDisabled)
+            Button("Off") { Task { await actions.turnOff() } }.disabled(actions.offDisabled)
+            Divider()
+            if !incoming && model.destination == .teams {
+                Toggle("Ready for Calls", isOn: Binding(get: { model.microphoneArmed }, set: { value in
+                    Task { await model.setMicrophoneArmed(value) }
+                }))
+                .disabled(model.phase == .stopping || model.checkingAPI || (model.active && !model.microphoneArmed))
+            }
+            Button("Start Original Audio") { Task { await actions.startOriginal() } }.disabled(actions.originalDisabled)
+            Toggle("Show Timing", isOn: $timingVisible)
+            Button("Route and Audio…", action: configure)
+        } label: { Label("Options", systemImage: "ellipsis.circle").labelStyle(.iconOnly) }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .accessibilityLabel("\(incoming ? "Listen" : "Speak") options")
     }
 }
 
@@ -306,7 +364,7 @@ struct ConversationWindowSizing: NSViewRepresentable {
             return NSSize(width: min(maximum.width, max(minimum.width, size.width)), height: min(maximum.height, max(minimum.height, size.height)))
         }
         private func savedSize(compact: Bool) -> NSSize {
-            let fallback = compact ? NSSize(width: 440, height: 250) : NSSize(width: 980, height: 700)
+            let fallback = compact ? NSSize(width: 440, height: 250) : NSSize(width: 1120, height: 740)
             guard let values = defaults.array(forKey: compact ? Self.compactSizeKey : Self.expandedSizeKey), values.count == 2,
                   let width = values[0] as? NSNumber, let height = values[1] as? NSNumber,
                   CFGetTypeID(width) != CFBooleanGetTypeID(), CFGetTypeID(height) != CFBooleanGetTypeID(),

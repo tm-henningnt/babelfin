@@ -11,6 +11,8 @@ import BridgeCore
     @Published var voiceChoice: String?
     @Published var meetingChoice: String?
     @Published var applied = false
+    @Published var allSpeak = false
+    @Published var allListen = false
     private func reset() { voiceChoice = nil; meetingChoice = nil; applied = false }
 }
 
@@ -35,34 +37,29 @@ struct SetupWizardView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            SettingsHeading(title: "Language setup", detail: "Choose your language and the meeting language. Babelfin suggests a service for each direction.")
-            Form {
-                Section {
-                    Picker("You speak", selection: $state.userLanguage) { languageOptions }
-                    Picker("The meeting is in", selection: $state.meetingLanguage) { languageOptions }
-                } footer: {
-                    Text("Listen detects the language that others speak, so it also works if someone switches language.")
-                        .font(.caption).foregroundStyle(.secondary)
+        Form {
+            Section {
+                Picker("I speak", selection: $state.userLanguage) { languageOptions }
+                Picker("The meeting is in", selection: $state.meetingLanguage) { languageOptions }
+            }
+            suggestionSection(title: "Speak", from: userLanguage, to: meetingLanguage, suggestions: voiceSuggestions,
+                              current: conversation.outgoing.route, choice: $state.voiceChoice, showsAll: $state.allSpeak)
+            suggestionSection(title: "Listen", from: nil, to: userLanguage, suggestions: meetingSuggestions,
+                              current: conversation.incoming.route, choice: $state.meetingChoice, showsAll: $state.allListen)
+            Section {
+                HStack {
+                    Button("Manage Keys…", action: openAccounts)
+                    Spacer()
+                    if state.applied { Label("Applied", systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
+                    Button("Use These Services", action: apply).keyboardShortcut(.defaultAction)
+                        .disabled(conversation.locked || (selected(voiceSuggestions, voiceChoice, current: conversation.outgoing.route) == nil && selected(meetingSuggestions, meetingChoice, current: conversation.incoming.route) == nil))
                 }
-                suggestionSection(title: "Speak", detail: "Translates your speech into the meeting language. ElevenLabs and Fish Audio let you choose the voice that speaks for you.",
-                                  suggestions: voiceSuggestions, choice: $state.voiceChoice)
-                suggestionSection(title: "Listen", detail: "Translates the meeting into your language. A direct service such as OpenAI follows the voice of each speaker.",
-                                  suggestions: meetingSuggestions, choice: $state.meetingChoice)
-                Section {
-                    HStack {
-                        Button("Manage API keys…", action: openAccounts)
-                        Spacer()
-                        if state.applied { Label("Applied", systemImage: "checkmark.circle").foregroundStyle(.secondary) }
-                        Button("Apply", action: apply).keyboardShortcut(.defaultAction)
-                            .disabled(conversation.locked || (selected(voiceSuggestions, voiceChoice) == nil && selected(meetingSuggestions, meetingChoice) == nil))
-                    }
-                    if conversation.locked {
-                        Label("Stop both directions to apply a new setup.", systemImage: "lock").font(.callout).foregroundStyle(.secondary)
-                    }
+                if conversation.locked {
+                    Label("Stop both directions to change services.", systemImage: "lock").foregroundStyle(.secondary)
                 }
-            }.formStyle(.grouped)
+            }
         }
+        .formStyle(.grouped)
         .onAppear {
             state.userLanguage = conversation.incoming.targetLanguage
             state.meetingLanguage = conversation.outgoing.targetLanguage
@@ -73,51 +70,93 @@ struct SetupWizardView: View {
         ForEach(ProviderRegistry.allLanguages) { Text($0.name).tag($0.code) }
     }
 
-    private func selected(_ suggestions: [RouteAdvisor.Suggestion], _ choice: String?) -> RouteAdvisor.Suggestion? {
-        suggestions.first { $0.route.id == (choice ?? suggestions.first?.route.id) }
+    /// Without a choice, the route the direction uses now when it fits, else the first suggestion.
+    private static func defaultID(_ suggestions: [RouteAdvisor.Suggestion], current: TranslationRoute) -> String? {
+        suggestions.contains { $0.route.id == current.rawValue } ? current.rawValue : suggestions.first?.route.id
+    }
+    private func selected(_ suggestions: [RouteAdvisor.Suggestion], _ choice: String?, current: TranslationRoute) -> RouteAdvisor.Suggestion? {
+        suggestions.first { $0.route.id == (choice ?? Self.defaultID(suggestions, current: current)) }
     }
 
-    @ViewBuilder private func suggestionSection(title: String, detail: String, suggestions: [RouteAdvisor.Suggestion],
-                                                choice: Binding<String?>) -> some View {
+    private func languageName(_ code: String?) -> String {
+        code.flatMap { code in ProviderRegistry.allLanguages.first { $0.code == code }?.name } ?? "Any language"
+    }
+
+    @ViewBuilder private func suggestionSection(title: String, from: String?, to: String, suggestions: [RouteAdvisor.Suggestion],
+                                                current: TranslationRoute, choice: Binding<String?>, showsAll: Binding<Bool>) -> some View {
+        let chosen = selected(suggestions, choice.wrappedValue, current: current)
+        let pick: (String) -> Void = { choice.wrappedValue = $0; state.applied = false }
         Section {
             if suggestions.isEmpty {
-                Text(userLanguage == meetingLanguage ? "Both languages are the same, so this direction needs no translation."
-                     : "No service supports this language pair yet.")
-                    .font(.callout).foregroundStyle(.secondary)
-            } else {
-                Picker(title, selection: Binding(get: { choice.wrappedValue ?? suggestions.first?.route.id ?? "" },
-                                                 set: { choice.wrappedValue = $0; state.applied = false })) {
-                    ForEach(suggestions, id: \.route.id) { suggestion in
-                        Text(label(suggestion)).tag(suggestion.route.id)
+                Text(userLanguage == meetingLanguage ? "Both languages are the same. This direction needs no translation."
+                     : "No service supports this language pair.")
+                    .foregroundStyle(.secondary)
+            } else if let chosen {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(chosen.route.displayName).font(.title3.weight(.semibold))
+                    if chosen.route.id == suggestions.first?.route.id {
+                        Text("Suggested").font(.caption.weight(.semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 7).padding(.vertical, 2).background(Color.accentColor, in: Capsule())
                     }
-                }.pickerStyle(.radioGroup).labelsHidden()
+                    if chosen.route.id == current.rawValue {
+                        Text("In use").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .padding(.horizontal, 7).padding(.vertical, 2).background(Color.secondary.opacity(0.15), in: Capsule())
+                    }
+                    Spacer()
+                }
+                keys(chosen)
+                let others = suggestions.filter { $0.route.id != chosen.route.id }.prefix(2)
+                if !others.isEmpty {
+                    HStack(spacing: 6) {
+                        Text("Also good:").foregroundStyle(.secondary)
+                        ForEach(Array(others), id: \.route.id) { other in
+                            Button(other.route.displayName) { pick(other.route.id) }.buttonStyle(.link)
+                        }
+                        Spacer()
+                    }
+                }
+                DisclosureGroup("All \(suggestions.count) services", isExpanded: showsAll) {
+                    Picker(title, selection: Binding(get: { chosen.route.id }, set: pick)) {
+                        ForEach(suggestions, id: \.route.id) { suggestion in
+                            HStack {
+                                Text(suggestion.route.displayName)
+                                Text(status(suggestion)).foregroundStyle(.secondary)
+                            }.tag(suggestion.route.id)
+                        }
+                    }.pickerStyle(.radioGroup).labelsHidden()
+                }
             }
-        } header: { Text(title) } footer: { Text(detail).font(.caption).foregroundStyle(.secondary) }
+        } header: { Text("\(title) · \(languageName(from)) → \(languageName(to))") }
     }
 
-    private func label(_ suggestion: RouteAdvisor.Suggestion) -> String {
-        let language = suggestion.sourceLanguage == nil ? "detects the input language" : "fixed to your language"
+    /// The keys the route needs, each marked as saved or missing.
+    private func keys(_ suggestion: RouteAdvisor.Suggestion) -> some View {
+        let services = ProviderService.allCases.filter { suggestion.route.services.contains($0) }
+        return HStack(spacing: 12) {
+            if services.isEmpty {
+                Label("No key needed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            }
+            ForEach(services, id: \.self) { service in
+                let missing = suggestion.missingServices.contains(service)
+                    || suggestion.missingPermissions.contains { $0.service == service }
+                Label(service.displayName, systemImage: missing ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                    .foregroundStyle(missing ? Color.orange : Color.green)
+            }
+            Spacer()
+            if !suggestion.ready { Button("Add Key…", action: openAccounts) }
+        }
+    }
+
+    private func status(_ suggestion: RouteAdvisor.Suggestion) -> String {
         let missing = suggestion.missingServices.map(\.displayName).sorted()
-        let lacking = suggestion.missingPermissions.map { "\($0.service.displayName) \($0.name)" }
-        let status = !missing.isEmpty ? "needs a key for " + missing.joined(separator: " and ")
-            : !lacking.isEmpty ? "the key lacks " + lacking.joined(separator: " and ") : "ready"
-        return "\(suggestion.route.displayName) — \(language), \(status)"
+        if !missing.isEmpty { return "needs " + missing.joined(separator: " and ") }
+        if !suggestion.missingPermissions.isEmpty { return "key lacks a permission" }
+        return "ready"
     }
 
     private func apply() {
-        if let voice = selected(voiceSuggestions, voiceChoice), let route = TranslationRoute(rawValue: voice.route.id) {
-            configure(conversation.outgoing, route: route, source: voice.sourceLanguage, target: voice.targetLanguage)
-        }
-        if let meeting = selected(meetingSuggestions, meetingChoice), let route = TranslationRoute(rawValue: meeting.route.id) {
-            configure(conversation.incoming, route: route, source: meeting.sourceLanguage, target: meeting.targetLanguage)
-        }
+        if let voice = selected(voiceSuggestions, voiceChoice, current: conversation.outgoing.route) { conversation.outgoing.apply(voice) }
+        if let meeting = selected(meetingSuggestions, meetingChoice, current: conversation.incoming.route) { conversation.incoming.apply(meeting) }
         state.applied = true
-    }
-
-    /// The route first: changing it can reset values that the new route does not support.
-    private func configure(_ model: AppModel, route: TranslationRoute, source: String?, target: String) {
-        model.route = route
-        model.sourceLanguage = route.descriptor.acceptsLanguageHint ? (source ?? "") : ""
-        model.targetLanguage = target
     }
 }
