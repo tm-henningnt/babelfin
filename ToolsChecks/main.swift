@@ -53,7 +53,7 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
 
 @MainActor final class UnsafeFailureTranscriber: SpeechToolsTranscriber {
     let requiredServices: Set<ProviderService> = [.elevenLabs]
-    func transcribe(fileURL: URL, sourceLanguage: String?, diarize: Bool, credentials: ProviderCredentials) async throws -> RecordingTranscript {
+    func transcribe(source: RecordingSource, sourceLanguage: String?, diarize: Bool, credentials: ProviderCredentials) async throws -> RecordingTranscript {
         throw NSError(domain: "synthetic-secret /private/file.wav", code: 1, userInfo: [NSLocalizedDescriptionKey: "synthetic-secret"])
     }
     func cancel() { }
@@ -67,6 +67,7 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
             try await uploadChecks()
             try await translationAndNotesChecks()
             try await voiceChecks()
+            try await dubChecks()
             try await cancellationChecks()
             print("PASS: 15 speech-tools check groups (offline synthetic transport; no credentials or hardware)")
         } catch let error as CheckFailure {
@@ -142,6 +143,20 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
         try expect(body.contains("name=\"use_speaker_library\"\r\n\r\nfalse") && body.contains("name=\"webhook\"\r\n\r\nfalse"), "No identity library or webhook")
         try expect(!body.contains("private-name") && !body.contains("synthetic-key") && body.contains("fixture-bytes"), "Generic multipart filename and credential separation")
         print("PASS: actual batch adapter multipart schema and credential isolation")
+        let recorded = try SpeechToolsWAV.encode(pcm: Data(repeating: 0, count: 4_800))
+        let memoryHTTP = FakeHTTP([try fixture()])
+        _ = try await SpeechToolsService(transport: memoryHTTP).transcribe(source: .memory(wav: recorded), credentials: .init(elevenLabs: "synthetic-key"))
+        let memoryBody = memoryHTTP.requests.get()[0].httpBody ?? Data()
+        try expect(memoryBody.range(of: recorded) != nil && String(decoding: memoryBody, as: UTF8.self).contains("filename=\"recording.wav\"\r\nContent-Type: audio/wav"),
+                   "A microphone recording uploads from memory as WAV")
+        var sample = VoiceSampleBuffer(minimumSeconds: 2, maximumSeconds: 3)
+        let second = Data(repeating: 0, count: 48_000)
+        try sample.append(second)
+        try expect(!sample.meetsMinimum, "One second is below a two-second minimum")
+        try sample.append(second); try sample.append(second)
+        let overflowKept = try sample.append(second), wavBytes = try sample.wav().count
+        try expect(sample.meetsMinimum && sample.isFull && !overflowKept && wavBytes == 44 + 3 * 48_000, "A recording buffer keeps its own limits")
+        print("PASS: microphone recordings upload from memory within their own limits")
 
         let huge = directory.appendingPathComponent("large.wav")
         FileManager.default.createFile(atPath: huge.path, contents: nil)
@@ -204,11 +219,76 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
             try expect(http.requests.get().count == 1, "Only selected synthesis provider called")
         }
         print("PASS: Eleven-only/Fish-only voice clips with fragmented PCM")
+        func body(_ request: URLRequest) throws -> [String: Any] {
+            try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any] ?? [:]
+        }
+        let expressive = SpeechDirection(delivery: .expressive, speed: 1.5)
+        let elevenHTTP = FakeHTTP([pcm])
+        _ = try await SpeechToolsService(transport: elevenHTTP).voiceClip(text: "[whispers] A clip.", language: "en", voiceID: "fixture", route: .elevenLabs,
+                                                                         direction: expressive, credentials: .init(elevenLabs: "synthetic-key"))
+        let elevenRequest = try elevenHTTP.requests.get()[0], eleven = try body(elevenRequest)
+        let settings = eleven["voice_settings"] as? [String: Any]
+        try expect(elevenRequest.url?.path == "/v1/text-to-speech/fixture" && eleven["model_id"] as? String == "eleven_v3"
+                   && settings?["stability"] as? Double == 0 && settings?["speed"] as? Double == 1.2 && eleven["language_code"] as? String == "en",
+                   "Expressive ElevenLabs clips use v3 with creative stability and a clamped speed")
+        let fishHTTP = FakeHTTP([pcm])
+        _ = try await SpeechToolsService(transport: fishHTTP).voiceClip(text: "A clip.", language: "en", voiceID: nil, route: .fish,
+                                                                       direction: SpeechDirection(delivery: .steady, speed: 0.8), credentials: .init(fish: "synthetic-key"))
+        let fish = try body(fishHTTP.requests.get()[0])
+        try expect(fish["temperature"] as? Double == 0.5 && (fish["prosody"] as? [String: Any])?["speed"] as? Double == 0.8,
+                   "Steady Fish clips lower the temperature and set the speed")
+        print("PASS: directed voice clips set the model, delivery and speed")
+        let changerHTTP = FakeHTTP([pcm])
+        let revoiced = try await SpeechToolsService(transport: changerHTTP).revoice(
+            wav: try SpeechToolsWAV.encode(pcm: pcm), voiceID: "fixture", delivery: .steady, credentials: .init(elevenLabs: "synthetic-key"))
+        let changer = changerHTTP.requests.get()[0], changerBody = String(decoding: changer.httpBody ?? Data(), as: UTF8.self)
+        try expect(changer.url?.path == "/v1/speech-to-speech/fixture" && changerBody.contains("eleven_multilingual_sts_v2")
+                   && changerBody.contains(#"{"stability":1.0}"#) && !changerBody.contains("synthetic-key") && revoiced.count == pcm.count + 44,
+                   "The voice changer sends the recording with the delivery and returns a WAV")
+        do { _ = try await SpeechToolsService(transport: FakeHTTP()).revoice(wav: Data(repeating: 0, count: SpeechToolsLimits.voicePCMBytes + 46), voiceID: "fixture",
+                                                                         delivery: .natural, credentials: .init(elevenLabs: "synthetic-key"))
+             throw CheckFailure(message: "Long recording accepted for a new voice") }
+        catch SpeechToolsError.revoiceTooLong { }
+        print("PASS: the voice changer keeps the recording's timing and limits its length")
         let http = FakeHTTP(), service = SpeechToolsService(transport: http)
         do { _ = try await service.voiceClip(text: String(repeating: "a", count: 2_001), language: "en", voiceID: nil, route: .fish, credentials: .init()); throw CheckFailure(message: "Long clip accepted") }
         catch SpeechToolsError.clipTooLong { }
         try expect(http.requests.get().isEmpty, "Voice bound precedes network")
         print("PASS: voice text bound")
+    }
+
+    @MainActor static func dubChecks() async throws {
+        let placed = DubTimeline.place([.init(start: 0, duration: 2), .init(start: 1.5, duration: 1), .init(start: 10, duration: 1)])
+        try expect(abs(placed[0].rate - DubTimeline.maximumRate) < 0.0001 && abs(placed[1].start - (2 / 1.3 + 0.15)) < 0.0001
+                   && placed[1].rate == 1 && placed[2].start == 10 && placed[2].rate == 1,
+                   "A long passage plays faster up to the limit, then the next one moves back and later ones catch up")
+        let tone = PCM16.encode((0..<24_000).map { Float(sin(Double($0) / 10) * 0.5) })
+        let http = FakeHTTP([tone, tone]), service = SpeechToolsService(transport: http)
+        let transcript = RecordingTranscript(sourceLanguage: "no", targetLanguage: "en", segments: [
+            RecordingSegment(id: "a", sourceText: "Hei.", translatedText: "Hello.", startSeconds: 0.5, endSeconds: 1),
+            RecordingSegment(id: "b", sourceText: "Ha det.", translatedText: "Goodbye.", startSeconds: 4, endSeconds: 5)])
+        let wav = try await service.dub(transcript: transcript, source: .file(URL(fileURLWithPath: "/nonexistent.wav")), includeOriginal: false,
+                                        originalLevel: 0.25, voiceID: "fixture", route: .elevenLabs, direction: .standard,
+                                        credentials: .init(elevenLabs: "synthetic-key"))
+        let samples = try PCM16.decode(wav.dropFirst(44))
+        func loud(_ second: Double) -> Bool { samples[Int(second * 24_000)..<Int(second * 24_000) + 2_400].contains { abs($0) > 0.1 } }
+        try expect(http.requests.get().count == 2 && !loud(0.2) && loud(0.6) && !loud(2.7) && loud(4.2) && samples.count >= 5 * 24_000,
+                   "Each translated passage starts at its segment's time")
+        let originalURL = FileManager.default.temporaryDirectory.appendingPathComponent("babelfin-dub-check-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: originalURL) }
+        try SpeechToolsWAV.encode(pcm: PCM16.encode([Float](repeating: 0.3, count: 6 * 24_000))).write(to: originalURL)
+        let mixedHTTP = FakeHTTP([tone, tone])
+        let mixed = try PCM16.decode(try await SpeechToolsService(transport: mixedHTTP).dub(
+            transcript: transcript, source: .file(originalURL), includeOriginal: true, originalLevel: 0.25, voiceID: "fixture", route: .elevenLabs,
+            direction: .standard, credentials: .init(elevenLabs: "synthetic-key")).dropFirst(44))
+        try expect(mixed.count >= 6 * 24_000 - 240 && abs(mixed[Int(0.2 * 24_000)] - 0.3) < 0.01 && mixed.allSatisfy { abs($0) <= 1 },
+                   "The original plays at full level before the first passage and the mix stays in range")
+        let untimed = RecordingTranscript(sourceLanguage: "no", targetLanguage: "en", segments: [RecordingSegment(id: "a", sourceText: "Hei.", translatedText: "Hello.")])
+        do { _ = try await service.dub(transcript: untimed, source: .file(URL(fileURLWithPath: "/nonexistent.wav")), includeOriginal: false, originalLevel: 0.25,
+                                       voiceID: "fixture", route: .elevenLabs, direction: .standard, credentials: .init(elevenLabs: "synthetic-key"))
+             throw CheckFailure(message: "Untimed dub accepted") }
+        catch SpeechToolsError.dubUntimed { }
+        print("PASS: dubs place passages at segment times and need timed segments")
     }
 
     @MainActor static func cancellationChecks() async throws {

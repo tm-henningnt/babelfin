@@ -106,15 +106,15 @@ struct VoiceSettingsView: View {
     @ObservedObject var model: AppModel
     var allAudioStopped: () -> Bool
     @StateObject private var state = VoiceSettingsState()
-    private var provider: VoiceProvider { model.route == .fish ? .fish : .elevenLabs }
+    private var provider: VoiceProvider { model.route.descriptor.speechService == .fish ? .fish : .elevenLabs }
     var body: some View {
         Section {
-            if model.route == .openAI {
+            if model.route.descriptor.isDirect {
                 LabeledContent("Voice", value: "Follows the speaker")
             } else {
                 HStack(spacing: 12) {
                     Picker("Voice", selection: $model.voiceID) {
-                        Text(model.route == .fish ? "Default voice" : "Choose a voice").tag("")
+                        Text(provider == .fish ? "Default voice" : "Choose a voice").tag("")
                         if !model.voiceID.isEmpty, !state.voices.contains(where: { $0.id == model.voiceID }) { Text("Saved voice").tag(model.voiceID) }
                         ForEach(state.voices.filter(\.isReady)) { Text($0.name).tag($0.id) }
                     }.disabled(model.configurationLocked || state.busy)
@@ -132,7 +132,7 @@ struct VoiceSettingsView: View {
                         state.preview(provider, voiceID: model.voiceID, output: device)
                     } label: { Label("Preview", systemImage: "play.fill") }
                         .accessibilityLabel("Preview voice")
-                        .disabled(state.busy || !allAudioStopped() || state.outputUID.isEmpty || (model.route == .elevenLabs && model.voiceID.isEmpty))
+                        .disabled(state.busy || !allAudioStopped() || state.outputUID.isEmpty || (provider == .elevenLabs && model.voiceID.isEmpty))
                 }
                 HStack {
                     Text("Create a voice from your own recording or an audio file.").font(.callout).foregroundStyle(.secondary)
@@ -177,7 +177,9 @@ struct CredentialKeyRow: View {
     let storageMode: CredentialStorageMode
     var allAudioStopped: () -> Bool
     @ObservedObject private var activity = CredentialOperationActivity.shared
+    @ObservedObject private var checks = KeyCheckStore.shared
     @StateObject private var state = CredentialFieldState()
+    private var report: KeyCheckReport? { checks.report(for: service, storage: storageMode) }
     /// One line per provider: name, key field, saved state and actions. Notices appear below only when present.
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -193,42 +195,73 @@ struct CredentialKeyRow: View {
                     prompt: Text(state.saved == true ? "Saved — paste to replace" : "Paste your API key"))
                     .textFieldStyle(.roundedBorder).labelsHidden().accessibilityLabel("\(title) API key")
                 Group {
-                    if state.saved == true { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+                    if state.saved == true, let report, !report.missing.isEmpty { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                    else if state.saved == true { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
                     else if state.saved == false { Image(systemName: "circle.dashed").foregroundStyle(.secondary) }
                     else { Image(systemName: "questionmark.circle").foregroundStyle(.secondary) }
                 }
-                .help(state.saved == true ? "Key saved" : state.saved == false ? "No key saved" : "Key status unavailable")
-                .accessibilityLabel(state.saved == true ? "Key saved" : state.saved == false ? "No key saved" : "Key status unavailable")
+                .help(statusText).accessibilityLabel(statusText)
                 Button("Save") {
                     guard allAudioStopped(), !activity.active else { return }
                     do {
+                        let key = state.draft.trimmingCharacters(in: .whitespacesAndNewlines)
                         try KeychainStore.save(state.draft, for: service, storage: storageMode)
                         state.draft = ""; state.saved = true
+                        checks.discard(service, storage: storageMode)
                         NotificationCenter.default.post(name: .babelfinCredentialMetadataChanged, object: nil)
                         state.notice = storageMode == .keychain ? "Saved in Keychain." : "Saved on this Mac."
+                        let storage = storageMode
+                        Task { await checks.check(service, storage: storage, key: key) }
                     }
                     catch let error as LocalCredentialError { state.notice = error.errorDescription ?? "Could not save the key." }
                     catch { state.notice = "Could not save the key." }
                 }.disabled(state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    .accessibilityLabel("Save \(title) API key")
+                    .fixedSize().accessibilityLabel("Save \(title) API key")
                 Button("Remove", role: .destructive) {
                     guard allAudioStopped(), !activity.active else { return }
                     do {
                         try KeychainStore.delete(for: service, storage: storageMode); state.saved = false
+                        checks.discard(service, storage: storageMode)
                         NotificationCenter.default.post(name: .babelfinCredentialMetadataChanged, object: nil)
                         state.notice = storageMode == .keychain ? "Removed from Keychain." : "Removed from this Mac."
                     }
                     catch let error as LocalCredentialError { state.notice = error.errorDescription ?? "Could not remove the key." }
                     catch { state.notice = "Could not remove the key." }
-                }.disabled(state.saved == false).accessibilityLabel("Remove \(title) API key")
+                }.disabled(state.saved == false).fixedSize().accessibilityLabel("Remove \(title) API key")
             }
             if !state.notice.isEmpty {
                 Text(state.notice).font(.caption).foregroundStyle(.secondary).padding(.leading, 130)
+            }
+            if state.saved == true, !KeyPermissions.for(service).isEmpty {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if let report {
+                        Text(report.summary).font(.caption).foregroundStyle(report.missing.isEmpty ? Color.secondary : Color.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 0)
+                    Button(checkButtonTitle) {
+                        let storage = storageMode
+                        Task { await checks.check(service, storage: storage) }
+                    }.controlSize(.small).disabled(checks.checking.contains(service))
+                        .help("Checks which permissions the key has. The check sends requests that produce nothing and cost no credits.")
+                        .accessibilityLabel("Check \(title) API key permissions")
+                }.padding(.leading, 130)
             }
         }.disabled(!allAudioStopped() || activity.active)
             .onAppear { refreshPresence() }
             .onChange(of: storageMode) { _ in refreshPresence(); NotificationCenter.default.post(name: .babelfinCredentialMetadataChanged, object: nil) }
             .onDisappear { state.draft = ""; state.notice = "" }
+    }
+    private var statusText: String {
+        switch state.saved {
+        case true?: return report.map { $0.missing.isEmpty ? "Key saved" : "Key saved, but it lacks permissions" } ?? "Key saved"
+        case false?: return "No key saved"
+        case nil: return "Key status unavailable"
+        }
+    }
+    private var checkButtonTitle: String {
+        if checks.checking.contains(service) { return "Checking…" }
+        return report == nil ? "Check key" : "Check again"
     }
     private func refreshPresence() {
         state.draft = ""; state.notice = ""

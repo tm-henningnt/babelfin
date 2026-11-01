@@ -151,19 +151,27 @@ public struct ProviderCapabilities: Sendable {
     public let requiresAPIKey: Bool
     public let documentationDate: String
     public let userConfirmedOutputLanguages: Set<SupportedTargetLanguage>
-    public var outputLanguages: [TranslationLanguage] {
-        switch providerID {
-        case "openai": return targetLanguages.map { TranslationLanguage(code: $0.rawValue, name: $0.name) }
-        case "elevenlabs": return TranslationLanguage.elevenLabsOutputs
-        default: return TranslationLanguage.composedOutputs
-        }
-    }
-    public var inputLanguages: [TranslationLanguage] {
-        providerID == "openai" ? [] : TranslationLanguage.elevenLabsOutputs
-    }
-    public var requiresVoiceID: Bool { providerID == "elevenlabs" }
+    private var registered: RouteDescriptor? { ProviderRegistry.routes.first { $0.id == providerID } }
+    public var outputLanguages: [TranslationLanguage] { registered?.outputLanguages ?? [] }
+    public var inputLanguages: [TranslationLanguage] { registered?.inputLanguages ?? [] }
+    public var requiresVoiceID: Bool { registered?.speechService == .elevenLabs }
     public static func forRoute(_ route: TranslationRoute) -> ProviderCapabilities {
-        switch route { case .openAI: return .openAITranslation; case .elevenLabs: return .elevenLabsTranslation; case .fish: return .fishTranslation }
+        switch route {
+        case .openAI: return .openAITranslation
+        case .elevenLabs: return .elevenLabsTranslation
+        case .fish: return .fishTranslation
+        default:
+            // A route without a hand-written record: describe it from its stages.
+            let descriptor = route.descriptor
+            return ProviderCapabilities(
+                providerID: descriptor.id, providerName: descriptor.stages.map { $0.service?.displayName ?? "Your server" }.joined(separator: " + "),
+                modelID: descriptor.stages.map(\.modelID).joined(separator: " / "),
+                sourceLanguageMode: descriptor.acceptsLanguageHint ? .automaticOrHint : .automatic,
+                targetLanguages: SupportedTargetLanguage.allCases,
+                voiceMode: descriptor.isDirect ? .dynamicAdaptation : .selectableOrCloned,
+                transcriptMode: descriptor.isDirect ? .appendOnly : .revisionedSegments,
+                requiresNetwork: true, requiresAPIKey: true, documentationDate: "", userConfirmedOutputLanguages: [])
+        }
     }
     public func validate(_ configuration: TranslationConfiguration) throws {
         guard outputLanguages.contains(where: { $0.code == configuration.targetLanguage }) else { throw BridgeError.unsupportedLanguage }

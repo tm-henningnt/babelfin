@@ -35,6 +35,8 @@ private func expect(_ condition: @autoclosure () -> Bool, _ message: String) thr
         await onEvent?(.closed)
     }
     func cancel() { cancels += 1 }
+    var pacings: [TranslationPacing] = []
+    func updatePacing(_ pacing: TranslationPacing) { pacings.append(pacing) }
     func emit(_ segment: TranscriptSegment) async { await onEvent?(.segment(segment)) }
 }
 @MainActor private final class Translator: TextTranslationStage {
@@ -115,8 +117,8 @@ private final class Clock: @unchecked Sendable {
         provider.onEvent = { [events] event in events.values.append(event) }
         provider.onAudio = { [bytes] data in bytes.append(data) }
     }
-    func start() async throws {
-        try await provider.start(configuration: .init(targetLanguage: "no", route: .elevenLabs, voiceID: "fixture-voice"),
+    func start(speaks: Bool = true) async throws {
+        try await provider.start(configuration: .init(targetLanguage: "no", route: .elevenLabs, voiceID: "fixture-voice", speaksTranslation: speaks),
                                  credentials: .init(openAI: "fixture-openai", elevenLabs: "fixture-eleven"))
     }
 }
@@ -136,6 +138,13 @@ private final class Clock: @unchecked Sendable {
             catch is CheckFailure { throw CheckFailure(message: "OpenAI ignored unsupported selected voice") }
             catch {}
             try expect(!TranslationWire.supportedTargets.contains("no") && ProviderCapabilities.forRoute(.elevenLabs).outputLanguages.contains { $0.code == "no" }, "Route language coverage conflated")
+            let live = Fixture(); try await live.start()
+            let faster = TranslationConfiguration(targetLanguage: "no", route: .elevenLabs, voiceID: "fixture-voice", pacing: .fast)
+            try expect(live.provider.applyLive(faster) && live.recognizer.pacings == [.fast], "Delay applies to a running session without a restart")
+            try expect(live.provider.applyLive(faster) && live.recognizer.pacings == [.fast], "An unchanged Delay is not sent again")
+            let otherRoute = TranslationConfiguration(targetLanguage: "no", route: .fish, voiceID: "fixture-voice", pacing: .fast)
+            try expect(!live.provider.applyLive(otherRoute) && live.recognizer.starts == 1, "A route change still needs a new session")
+            passed += 1
             var revision = TranscriptRevisionLedger(maximumSegments: 1)
             _ = try revision.accept(.init(id: "one", text: "draft"))
             do { _ = try revision.accept(.init(id: "two", text: "overflow")); throw CheckFailure(message: "Ledger must bound unique IDs") }
@@ -308,6 +317,15 @@ private final class Clock: @unchecked Sendable {
             try expect(stale.events.failures == ["translation_backlog_stale"], "Old in-flight work must fail explicitly")
             stale.translator.release()
             passed += 1; print("PASS: Backlog age includes in-flight work")
+
+            let silent = Fixture(); try await silent.start(speaks: false)
+            for id in ["one", "two", "three"] { await silent.recognizer.emit(.init(id: id, text: id, isFinal: true)) }
+            try await until { silent.events.targets.count == 3 }
+            try await Task.sleep(nanoseconds: 20_000_000)
+            try expect(silent.synthesizer.calls.isEmpty && silent.bytes.packets.isEmpty && silent.events.failures.isEmpty,
+                       "Text-only translation must never call speech synthesis")
+            silent.provider.cancel()
+            passed += 1; print("PASS: Text-only translation emits every translation without speech synthesis")
 
             let behind = Fixture(clock: clock)
             behind.synthesizer.blocked = true; try await behind.start()

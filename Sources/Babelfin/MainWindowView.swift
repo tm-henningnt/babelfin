@@ -7,8 +7,8 @@ enum MainSection: String, CaseIterable, Hashable {
     case outgoing, incoming, transcript, recording, notes, voice
     var title: String {
         switch self {
-        case .outgoing: return "Your voice"
-        case .incoming: return "Meeting audio"
+        case .outgoing: return "Speak"
+        case .incoming: return "Listen"
         case .transcript: return "Transcript"
         case .recording: return "Audio file"
         case .notes: return "Meeting notes"
@@ -73,7 +73,7 @@ extension AppModel {
         return !setupRequirements.isEmpty ? .orange : .secondary
     }
     var voiceDisplayName: String {
-        if route == .openAI { return "Follows the speaker" }
+        if route.descriptor.isDirect { return "Follows the speaker" }
         if voiceID.isEmpty { return capabilities.requiresVoiceID ? "Choose a voice" : "Default voice" }
         return VoiceNameCache.name(for: voiceID) ?? "Saved voice"
     }
@@ -82,7 +82,11 @@ extension AppModel {
 struct MainWindowView: View {
     @ObservedObject var conversation: ConversationModel
     @ObservedObject private var navigation = MainNavigation.shared
+    #if BABELFIN_SCREENSHOTS
+    @StateObject private var tools = ScreenshotDemo.tools()
+    #else
     @StateObject private var tools = SpeechToolsModel()
+    #endif
     var showCompact: () -> Void
     var body: some View {
         VStack(spacing: 0) {
@@ -157,9 +161,9 @@ struct MainWindowView: View {
     }
     private var statusBar: some View {
         HStack(spacing: 10) {
-            Text("Your voice: \(conversation.outgoing.shortStatus)")
+            Text("Speak: \(conversation.outgoing.shortStatus)")
             Text("·").accessibilityHidden(true)
-            Text("Meeting audio: \(conversation.incoming.shortStatus)")
+            Text("Listen: \(conversation.incoming.shortStatus)")
             Spacer()
             if conversation.active {
                 Button("Turn both off") { Task {

@@ -17,6 +17,13 @@ _Static_assert(__atomic_always_lock_free(1, 0) && __atomic_always_lock_free(4, 0
 #define ORIGINAL_GATE (UINT64_C(1) << 37)
 #define TRANSLATED_GATE (UINT64_C(1) << 38)
 #define SPEECH_MUTED (UINT64_C(1) << 39)
+// Ducking, at the 24 kHz render rate, like a live dub: under translated speech the original
+// dips over 150 ms to 40 % of its configured gain. It stays down through pauses shorter than
+// 1 s, so it does not pump between phrases, then rises back over 600 ms.
+#define DUCK_DEPTH 0.4f
+#define DUCK_ATTACK_FRAMES 3600.0f
+#define DUCK_HOLD_FRAMES 24000u
+#define DUCK_RELEASE_FRAMES 14400.0f
 #define EPOCH (UINT64_C(1) << 40)
 #define EPOCH_MASK (UINT64_C(0xffffff) << 40)
 
@@ -236,12 +243,15 @@ BFMixerRender bf_mixer_render(BFMixer *m, float *output, size_t count) {
         if (c & (ORIGINAL_ONLY | TRANSLATED_GATE | SPEECH_MUTED)) speech = 0;
         if (c & ORIGINAL_ONLY) { m->gain = 1; m->hold = 0; }
         if (fabsf(speech) > 0.001f) m->speech_started = true;
-        if (!(c & ORIGINAL_ONLY) && (c & DUCKING) && fabsf(speech) > 0.001f) m->hold = 3600;
+        if (!(c & ORIGINAL_ONLY) && (c & DUCKING) && fabsf(speech) > 0.001f) m->hold = DUCK_HOLD_FRAMES;
         else if (m->hold) --m->hold;
         // With speech muted the duck releases within 80 ms, together with the original's fade-up.
         if (c & SPEECH_MUTED) m->hold = 0;
-        float target = !(c & ORIGINAL_ONLY) && (c & DUCKING) && m->hold ? 0.15f : 1;
-        float step = target < m->gain ? 0.85f / 240 : (c & SPEECH_MUTED ? 0.85f / 1920 : 0.85f / 4800);
+        float target = !(c & ORIGINAL_ONLY) && (c & DUCKING) && m->hold ? DUCK_DEPTH : 1;
+        float frames = DUCK_RELEASE_FRAMES;
+        if (target < m->gain) frames = DUCK_ATTACK_FRAMES;
+        else if (c & SPEECH_MUTED) frames = 1920;
+        float step = (1 - DUCK_DEPTH) / frames;
         m->gain += fminf(step, fmaxf(-step, target - m->gain));
         float level = c & ORIGINAL_ONLY ? 1 : sample(c);
         float headroom = c & ORIGINAL_ONLY || !(c & MIXES) ? 1 : 1 / (1 + level);

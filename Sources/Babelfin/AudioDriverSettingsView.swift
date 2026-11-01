@@ -70,7 +70,7 @@ struct AudioDriverSettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             SettingsHeading(title: "Audio devices",
-                detail: "Babelfin Microphone sends your translated voice to a meeting app. Babelfin Speaker brings meeting audio to Babelfin.")
+                detail: "Babelfin Microphone sends your translated speech to a meeting app. Babelfin Speaker brings the meeting's audio to Babelfin for Listen.")
             Form {
                 Section {
                     LabeledContent("Status") {

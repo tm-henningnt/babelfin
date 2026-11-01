@@ -14,8 +14,8 @@ struct PipelineTimingView: View {
     private var timings: [PassageTiming] { model.passageTimings }
 
     var body: some View {
-        if model.route == .openAI {
-            Text("OpenAI recognizes, translates and speaks in one step, so Babelfin cannot time each stage. In tests the translation followed the speaker by about 8 seconds.")
+        if model.route.descriptor.isDirect {
+            Text("\(model.route.displayName) recognizes, translates and speaks in one step, so Babelfin cannot time each stage." + (model.route == .openAI ? " In tests the translation followed the speaker by about 8 seconds." : ""))
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         } else if let last = timings.last {
             if compact { compactLine(last) } else { table(last) }

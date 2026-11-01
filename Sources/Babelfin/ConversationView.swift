@@ -32,8 +32,9 @@ struct ConversationSettingsView: View {
         HStack(spacing: 0) {
             List(selection: $navigation.selection) {
                 Section("Translation") {
-                    Label("Your voice", systemImage: "mic").tag(SettingsDestination.outgoing)
-                    Label("Meeting audio", systemImage: "headphones").tag(SettingsDestination.incoming)
+                    Label("Language setup", systemImage: "wand.and.stars").tag(SettingsDestination.setup)
+                    Label("Speak", systemImage: "mic").tag(SettingsDestination.outgoing)
+                    Label("Listen", systemImage: "headphones").tag(SettingsDestination.incoming)
                 }
                 Section {
                     Label("Accounts", systemImage: "key").tag(SettingsDestination.accounts)
@@ -52,6 +53,8 @@ struct ConversationSettingsView: View {
                     SettingsView(model: direction == .outgoing ? conversation.outgoing : conversation.incoming,
                         direction: direction, allAudioStopped: { !conversation.locked }, openAccounts: { navigation.selection = .accounts })
                         .id(direction)
+                case .setup:
+                    SetupWizardView(conversation: conversation, openAccounts: { navigation.selection = .accounts })
                 case .accounts:
                     AccountSettingsView(allAudioStopped: { !conversation.locked })
                 case .audioDevices:
@@ -70,7 +73,7 @@ struct ConversationSettingsView: View {
 }
 
 enum SettingsDestination: Hashable {
-    case outgoing, incoming, accounts, audioDevices, troubleshooting
+    case setup, outgoing, incoming, accounts, audioDevices, troubleshooting
 }
 
 @MainActor private final class SettingsNavigationState: ObservableObject {
@@ -82,12 +85,13 @@ enum SettingsDestination: Hashable {
 struct ConversationMenu: View {
     @ObservedObject var conversation: ConversationModel
     var body: some View {
-        StatusDirectionItems(model: conversation.outgoing, title: "Your voice")
+        StatusDirectionItems(model: conversation.outgoing, title: "Speak")
         Divider()
-        StatusDirectionItems(model: conversation.incoming, title: "Meeting audio")
+        StatusDirectionItems(model: conversation.incoming, title: "Listen")
         Divider()
         SectionButton(section: conversation.direction == .outgoing ? .outgoing : .incoming, title: "Open Babelfin")
         SectionButton(section: .transcript)
+        SubtitleToggleButton()
         SectionButton(section: .recording, title: "Audio tools")
         Divider()
         OpenSettingsButton()
@@ -110,6 +114,9 @@ private struct StatusDirectionItems: View {
         }
         if !actions.offDisabled {
             Button("Off") { Task { await actions.turnOff() } }
+        }
+        if !model.pendingRestart.isEmpty {
+            Button("Restart to Apply Changes") { Task { await model.restartTranslation() } }
         }
         Picker("Hear: \(model.hearing.title)", selection: Binding(get: { model.hearing }, set: { model.hearing = $0 })) {
             ForEach(AppModel.Hearing.allCases) { Text($0.title).tag($0) }

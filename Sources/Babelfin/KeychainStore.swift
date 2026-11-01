@@ -104,11 +104,10 @@ enum KeychainStore {
     }
     static func credentials(for route: TranslationRoute) throws -> ProviderCredentials {
         let selectedStorage = storageMode
-        switch route {
-        case .openAI: return try ProviderCredentials(openAI: load(storage: selectedStorage))
-        case .elevenLabs: return try ProviderCredentials(openAI: load(storage: selectedStorage), elevenLabs: load(for: .elevenLabs, storage: selectedStorage))
-        case .fish: return try ProviderCredentials(openAI: load(storage: selectedStorage), elevenLabs: load(for: .elevenLabs, storage: selectedStorage), fish: load(for: .fish, storage: selectedStorage))
-        }
+        // Load only the keys that the route's stages use.
+        var keys: [ProviderService: String] = [:]
+        for service in route.requiredServices { keys[service] = try load(for: service, storage: selectedStorage) }
+        return ProviderCredentials(keys)
     }
 }
 

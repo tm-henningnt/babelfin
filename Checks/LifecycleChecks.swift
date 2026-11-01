@@ -198,12 +198,28 @@ private final class InventoryFixture: @unchecked Sendable {
 @main private struct LifecycleChecks {
     @MainActor static func main() async {
         let checks: [(String, @MainActor () async throws -> Void)] = [
+            ("Settings change during translation and wait for Restart when the session needs it", {
+                let trace = Trace(), audio = FakeAudio(trace)
+                let app = model(FakeProvider(trace), audio)
+                await app.setTranslationEnabled(true)
+                try await until { app.phase == .running }
+                try require(app.translating && !app.configurationLocked, "Settings must stay editable while translating")
+                app.targetLanguage = "de"; app.pacing = .fast
+                try require(app.targetLanguage == "de" && app.pacing == .fast, "Changes during translation must be kept, not reverted")
+                try require(app.pendingRestart == [.outputLanguage, .delay], "A provider without live updates marks both for Restart: \(app.pendingRestart)")
+                try require(app.phase == .running && audio.starts == 1, "A pending change must not restart the session by itself")
+                await app.restartTranslation()
+                try await until { app.translating && !app.reconnecting }
+                try require(app.pendingRestart.isEmpty && audio.starts == 1, "Restart without device changes reconnects on the same audio and clears the marks")
+                await app.stop()
+                try require(app.pendingRestart.isEmpty, "Nothing is pending after Off")
+            }),
             ("Hear changes live during translation and resets to the translation at launch", {
                 let trace = Trace(), audio = FakeAudio(trace)
                 let app = model(FakeProvider(trace), audio)
                 await app.setTranslationEnabled(true)
                 try await until { app.phase == .running }
-                try require(app.configurationLocked && app.hearing == .translation, "Fixture must translate with Hear: Translation")
+                try require(app.translating && !app.configurationLocked && app.hearing == .translation, "Fixture must translate with Hear: Translation")
                 app.hearing = .original
                 try require(app.hearing == .original && audio.listening.last?.muted == true, "Hear Original must mute speech live")
                 app.hearing = .both
@@ -219,7 +235,7 @@ private final class InventoryFixture: @unchecked Sendable {
                 await app.setTranslationEnabled(true)
                 try await until { app.phase == .running }
                 try require(audio.volumes.last == 0.4, "Start must apply the saved volume: \(audio.volumes)")
-                try require(app.configurationLocked, "Fixture must be translating with settings locked")
+                try require(app.translating, "Fixture must be translating")
                 app.outputVolume = 0.7
                 try require(app.outputVolume == 0.7 && audio.volumes.last == 0.7, "Volume must change live during translation")
                 app.outputVolume = 3
@@ -402,6 +418,48 @@ private final class InventoryFixture: @unchecked Sendable {
                     await fifth.onEvent?(.failure("translation_disconnected")); try await until { sixth.starts == 1 && !app.bypass }
                     await app.stop()
                 }
+            }),
+            ("Text-only translation plays the original at full volume and keeps translated audio silent", {
+                let trace = Trace(), catalog = DeviceCatalog(), clock = TextClock(), audio = FakeAudio(trace)
+                let provider = FakeProvider(trace)
+                let app = recoveryModel([provider], audio, catalog: catalog, clock: clock)
+                app.speakTranslation = false
+                await app.start()
+                try require(app.active && !app.bypass, "Text-only translation did not start")
+                try require(audio.mixEnabled && audio.mixLevel == Float(1) && !audio.mixDucking, "Text-only must play the original at full volume")
+                try require(provider.configuration?.speaksTranslation == false, "Provider must know that it should not speak")
+                let played = trace.values.filter { $0 == "translated-play" }.count
+                try await provider.onAudio?(Data([0, 0]))
+                try require(trace.values.filter { $0 == "translated-play" }.count == played, "Text-only must not play translated audio")
+                await app.stop()
+            }),
+            ("Every registered stage has a factory, and routes decode only by known ID", {
+                let serverWasAvailable = ProviderRegistry.translationServerAvailable
+                defer { ProviderRegistry.translationServerAvailable = serverWasAvailable }
+                ProviderRegistry.translationServerAvailable = true
+                try require(TranslationRoute(rawValue: "fish-server")?.requiredServices == [.elevenLabs, .fish],
+                            "A server route must need only the speech accounts")
+                for stage in ProviderRegistry.stages {
+                    let built: Bool
+                    switch stage.kind {
+                    case .direct: built = ProviderFactory.direct(stage.id) != nil
+                    case .recognition: built = ProviderFactory.recognizer(stage.id) != nil
+                    case .translation: built = ProviderFactory.translator(stage.id) != nil
+                    case .synthesis: built = ProviderFactory.synthesizer(stage.id) != nil
+                    }
+                    try require(built, "No factory for stage \(stage.id)")
+                }
+                for route in TranslationRoute.allCases {
+                    let provider = ProviderFactory.make(route)
+                    try require((provider is OpenAITranslationProvider) == route.descriptor.isDirect, "Route \(route.rawValue) built the wrong provider kind")
+                }
+                try require(TranslationRoute(rawValue: "fish") == .fish && TranslationRoute(rawValue: "unknown") == nil, "Route IDs must decode only when registered")
+                ProviderRegistry.translationServerAvailable = false
+                try require(TranslationRoute(rawValue: "fish-server") == nil, "Server routes must disappear without a saved server")
+                let encoded = try JSONEncoder().encode([TranslationRoute.elevenLabs])
+                let decoded = try JSONDecoder().decode([TranslationRoute].self, from: encoded)
+                try require(String(decoding: encoded, as: UTF8.self) == "[\"elevenlabs\"]" && decoded == [.elevenLabs], "Route must encode as its ID")
+                try require((try? JSONDecoder().decode([TranslationRoute].self, from: Data("[\"unknown\"]".utf8))) == nil, "Unknown route must not decode")
             }),
             ("Late translated audio returns to original and reconnects; only a playback failure stops", {
                 for code in ["received_audio_stale", "received_audio_backlog", "audio_burst_exceeds_five_seconds"] {

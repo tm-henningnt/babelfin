@@ -6,7 +6,7 @@ public enum AudioDestination: String, CaseIterable, Identifiable {
     public var label: String {
         switch self {
         case .teams: return "Teams virtual microphone"
-        case .listen: return "Listen locally"
+        case .listen: return "My headphones"
         }
     }
 }
@@ -41,7 +41,7 @@ public enum AudioRouting {
             }
         case .listen:
             guard output.kind == .physical else {
-                throw BridgeError.unavailable("Listen locally requires headphones or speakers as the output.")
+                throw BridgeError.unavailable("My headphones requires headphones or speakers as the output.")
             }
         }
     }

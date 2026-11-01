@@ -10,12 +10,20 @@ public enum SpeechToolsLimits {
     public static let notesBytes = 200_000
     public static let notesChunkBytes = 12_000
     public static let voiceCharacters = 2_000
+    /// Takes kept in memory for comparison; the oldest goes first.
+    public static let voiceTakes = 5
     public static let voicePCMBytes = 24_000 * 2 * 90
+    /// A dub covers up to 15 minutes of the original recording.
+    public static let dubSeconds = 900.0
+    public static let dubPCMBytes = 24_000 * 2 * 900
+    /// A microphone recording in the tools: 8 minutes of 24 kHz mono WAV stays under the upload limit.
+    public static let microphoneSeconds = 480
 }
 
 public enum SpeechToolsError: LocalizedError, Sendable, Equatable {
     case recordingTooLarge, invalidRecording, unsupportedFormat, invalidResponse
     case transcriptTooLarge, notesTooLarge, emptyText, clipTooLong, invalidPCM, unsupportedVoiceProvider
+    case dubUntimed, dubTooLong, revoiceTooLong
     public var errorDescription: String? {
         switch self {
         case .recordingTooLarge: return "Choose a recording up to 25 MB."
@@ -28,6 +36,9 @@ public enum SpeechToolsError: LocalizedError, Sendable, Equatable {
         case .clipTooLong: return "Voice clips can contain up to 2,000 characters."
         case .invalidPCM: return "The service returned an unsupported audio clip."
         case .unsupportedVoiceProvider: return "Choose ElevenLabs or Fish Audio for a voice clip."
+        case .dubUntimed: return "Dubbing needs segment times. Transcribe the recording with ElevenLabs, then translate it."
+        case .dubTooLong: return "A dub can cover up to 15 minutes. Split the recording into shorter parts."
+        case .revoiceTooLong: return "A new voice can replace up to 90 seconds of a recording. Record a shorter part."
         }
     }
 }
@@ -120,7 +131,7 @@ public struct MeetingNotes: Equatable, Sendable {
 }
 
 public struct SpeechToolsProgress: Equatable, Sendable {
-    public enum Stage: String, Sendable { case transcription, translation, notes, voiceClip }
+    public enum Stage: String, Sendable { case transcription, translation, notes, voiceClip, dub }
     public let stage: Stage
     public let completed: Int
     public let total: Int
@@ -153,17 +164,17 @@ public enum SpeechToolsText {
 
 public enum SpeechToolsWAV {
     /// Only our bounded canonical generated clips are accepted for local playback.
-    public static func decode(_ wav: Data) throws -> Data {
-        guard wav.count > 44, wav.count <= SpeechToolsLimits.voicePCMBytes + 44 else { throw SpeechToolsError.invalidPCM }
+    public static func decode(_ wav: Data, maximumBytes: Int = SpeechToolsLimits.voicePCMBytes) throws -> Data {
+        guard wav.count > 44, wav.count <= maximumBytes + 44 else { throw SpeechToolsError.invalidPCM }
         let pcm = Data(wav.dropFirst(44))
-        let canonical = try encode(pcm: pcm)
+        let canonical = try encode(pcm: pcm, maximumBytes: maximumBytes)
         guard canonical.prefix(44) == wav.prefix(44) else { throw SpeechToolsError.invalidPCM }
         return pcm
     }
 
     /// Canonical speech boundary: signed PCM16 little endian, mono, 24 kHz.
-    public static func encode(pcm: Data) throws -> Data {
-        guard !pcm.isEmpty, pcm.count.isMultiple(of: 2), pcm.count <= SpeechToolsLimits.voicePCMBytes else {
+    public static func encode(pcm: Data, maximumBytes: Int = SpeechToolsLimits.voicePCMBytes) throws -> Data {
+        guard !pcm.isEmpty, pcm.count.isMultiple(of: 2), pcm.count <= maximumBytes else {
             throw SpeechToolsError.invalidPCM
         }
         var output = Data(); output.reserveCapacity(44 + pcm.count)
@@ -174,5 +185,43 @@ public enum SpeechToolsWAV {
         u16(1); u16(1); u32(24_000); u32(48_000); u16(2); u16(16)
         ascii("data"); u32(UInt32(pcm.count)); output.append(pcm)
         return output
+    }
+}
+
+/// The audio for a transcription: a local file the user chose, or a microphone recording kept in memory.
+public enum RecordingSource: Equatable, Sendable {
+    case file(URL)
+    /// A canonical 24 kHz mono WAV recorded in the app. It is never written to disk.
+    case memory(wav: Data)
+
+    /// The bytes to upload and their file extension. A file must be a regular, non-symbolic-link
+    /// file within the size limit; `check` runs between reads so cancellation stops a large read.
+    public func upload(check: () throws -> Void) throws -> (fileExtension: String, bytes: Data) {
+        switch self {
+        case .memory(let wav):
+            guard !wav.isEmpty else { throw SpeechToolsError.invalidRecording }
+            guard wav.count <= SpeechToolsLimits.recordingBytes else { throw SpeechToolsError.recordingTooLarge }
+            return ("wav", wav)
+        case .file(let url):
+            guard url.isFileURL else { throw SpeechToolsError.invalidRecording }
+            do {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size > 0 else {
+                    throw SpeechToolsError.invalidRecording
+                }
+                guard size <= SpeechToolsLimits.recordingBytes else { throw SpeechToolsError.recordingTooLarge }
+                var bytes = Data(); bytes.reserveCapacity(size)
+                let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
+                while let chunk = try handle.read(upToCount: 65_536), !chunk.isEmpty {
+                    try check()
+                    guard chunk.count <= SpeechToolsLimits.recordingBytes - bytes.count else { throw SpeechToolsError.recordingTooLarge }
+                    bytes.append(chunk)
+                }
+                guard !bytes.isEmpty else { throw SpeechToolsError.invalidRecording }
+                return (url.pathExtension.lowercased(), bytes)
+            } catch let safe as SpeechToolsError { throw safe }
+            catch is CancellationError { throw CancellationError() }
+            catch { throw SpeechToolsError.invalidRecording }
+        }
     }
 }

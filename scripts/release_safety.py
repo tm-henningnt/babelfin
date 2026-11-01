@@ -54,8 +54,15 @@ def no_symlinks(path):
     if any(part.is_symlink() for part in (path, *path.parents)):
         raise ValueError("Symlinks are not allowed in release inputs or destination")
 
+# Third-party binaries contain their vendor's build-agent paths. Only these exact prefixes, only
+# in the named file, are removed before the scan; all other content is scanned as usual.
+# Assembled so that this source file contains no home path itself.
+VENDOR_BUILD_PATHS = {'libMicrosoftCognitiveServicesSpeech.dylib': (b'/'.join([b'', b'Users', b'runner', b'work', b'1', b's', b'']),)}
+
 def scan(name, data, policy=None):
     safe_path(name)
+    for prefix in VENDOR_BUILD_PATHS.get(name.rsplit('/', 1)[-1], ()):
+        data = data.replace(prefix, b'')
     lower_data = data.lower()
     # Never print the name if it itself contains a recognized secret/reference.
     for label, pattern in RULES:

@@ -145,7 +145,7 @@ final class LoopbackHTTPFixture: @unchecked Sendable {
         try expect(result == "Hello world", "Response must collect text across output items")
         let request = http.requests.get()[0], body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
         try expect(request.url?.path == "/v1/responses" && request.value(forHTTPHeaderField: "Authorization") == "Bearer fixture-openai", "Responses auth/path")
-        try expect(body["model"] as? String == "gpt-6-luna" && body["store"] as? Bool == false, "Verified model and store false")
+        try expect(body["model"] as? String == "gpt-5.6-luna" && body["store"] as? Bool == false, "Verified model and store false")
         try expect((body["input"] as? [[String: String]])?.first?["role"] == "user", "Speech remains user input")
         passed("Responses wire schema and structured output extraction")
         let incomplete = OpenAITextTranslationStage(transport: FakeHTTP([[json(["status": "incomplete", "output": []])]]))
@@ -160,6 +160,34 @@ final class LoopbackHTTPFixture: @unchecked Sendable {
         try await rejects { _ = try await cancellable.translate(text: "second", sourceLanguage: nil, targetLanguage: "en", credentials: credentials) }
         cancellable.cancel(); try await rejects { _ = try await work.value }
         passed("Translation overlapping request and cancellation")
+        do {
+            let reply = json(["choices": [["message": ["role": "assistant", "content": "  Hello world \n"]]]])
+            let local = FakeHTTP([[reply]])
+            let endpoint = try OpenAICompatibleTextTranslationStage.Endpoint(baseURL: "http://localhost:11434/v1", model: "llama3.1:8b")
+            let stage = OpenAICompatibleTextTranslationStage(endpoint: endpoint, transport: local)
+            let result = try await stage.translate(text: "Hei verden", sourceLanguage: "no", targetLanguage: "en", credentials: ProviderCredentials())
+            let request = local.requests.get()[0], body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
+            try expect(result == "Hello world", "Compatible endpoint must return the trimmed message content")
+            try expect(request.url?.absoluteString == "http://localhost:11434/v1/chat/completions" && request.value(forHTTPHeaderField: "Authorization") == nil,
+                       "Local endpoint uses chat completions without a key")
+            let messages = body["messages"] as? [[String: String]]
+            try expect(body["model"] as? String == "llama3.1:8b" && body["stream"] as? Bool == false && messages?.first?["role"] == "system"
+                       && messages?.last?["content"] == "Hei verden", "Compatible request carries model, instructions and speech as user text")
+            let keyed = FakeHTTP([[reply]])
+            _ = try await OpenAICompatibleTextTranslationStage(endpoint: try .init(baseURL: "https://models.example.com/v1", model: "translator"),
+                                                              apiKey: "fixture-key", transport: keyed)
+                .translate(text: "Hei", sourceLanguage: nil, targetLanguage: "en", credentials: ProviderCredentials())
+            try expect(keyed.requests.get()[0].value(forHTTPHeaderField: "Authorization") == "Bearer fixture-key", "Remote endpoint sends its key")
+            for (url, model) in [("http://models.example.com/v1", "m"), ("https://user:pass@models.example.com/v1", "m"), ("ftp://localhost/v1", "m"),
+                                 ("http://localhost:11434/v1", "bad model"), ("http://localhost:11434/v1?x=1", "m")] {
+                var rejected = false
+                do { _ = try OpenAICompatibleTextTranslationStage.Endpoint(baseURL: url, model: model) } catch { rejected = true }
+                try expect(rejected, "Endpoint \(url) with model \(model) must be rejected")
+            }
+            let empty = OpenAICompatibleTextTranslationStage(endpoint: endpoint, transport: FakeHTTP([[json(["choices": []])]]))
+            try await rejects { _ = try await empty.translate(text: "Hei", sourceLanguage: nil, targetLanguage: "en", credentials: ProviderCredentials()) }
+        }
+        passed("OpenAI-compatible text translation: wire, optional key, local-only plain HTTP")
         let audio = Box(Data()), pcm = Data((0..<9_602).map { UInt8($0 % 251) })
         let elevenHTTP = FakeHTTP([[Data(pcm.prefix(1)), Data(pcm[1..<4_802]), Data(pcm.dropFirst(4_802))]])
         let eleven = ElevenLabsSpeechSynthesisStage(transport: elevenHTTP)

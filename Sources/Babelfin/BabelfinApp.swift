@@ -31,19 +31,26 @@ import BridgeCore
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var conversation: ConversationModel
     init() {
+        // Register the server routes before saved preferences decode their route IDs.
+        TranslationServerSettings.applyToRegistry()
         if CommandLine.arguments.contains("--diagnostics") {
             for device in AudioDevices.all() {
                 print("\(device.name): input=\(device.inputChannels), output=\(device.outputChannels), physicalMic=\(device.isPhysicalInput), blackHole=\(device.isBlackHole)")
             }
             exit(0)
         }
+        #if canImport(MicrosoftCognitiveServicesSpeech)
+        ProviderRegistry.azureAvailable = true
+        #endif
         #if BABELFIN_SCREENSHOTS
         let instance = ScreenshotDemo.conversation()
         #else
         LegacySettingsImport.run()
         let instance = ConversationModel()
+        for model in [instance.outgoing, instance.incoming] { model.keyDiagnosis = { await KeyCheckStore.shared.diagnose($0) } }
         #endif
         let callPrompt = CallPromptController(model: instance.outgoing)
+        SubtitleOverlay.shared.attach(instance)
         _conversation = StateObject(wrappedValue: instance)
         AppDelegate.onQuit = { callPrompt.close(); instance.abort() }
     }
@@ -58,11 +65,13 @@ import BridgeCore
                 }
                 CommandGroup(replacing: .help) { Button("Babelfin Help") { AppLinks.openHelp() } }
                 CommandMenu("Translation") {
-                    DirectionCommands(model: conversation.outgoing, title: "Your voice", modifiers: [.command, .shift])
+                    DirectionCommands(model: conversation.outgoing, title: "Speak", modifiers: [.command, .shift])
                     Divider()
-                    DirectionCommands(model: conversation.incoming, title: "Meeting audio", modifiers: [.command, .shift, .option])
+                    DirectionCommands(model: conversation.incoming, title: "Listen", modifiers: [.command, .shift, .option])
                     Divider()
                     TurnBothOffButton(conversation: conversation).keyboardShortcut(".", modifiers: [.command, .shift])
+                    Divider()
+                    SubtitleToggleButton().keyboardShortcut("u", modifiers: [.command, .option])
                 }
                 CommandGroup(before: .windowList) {
                     SectionButton(section: .outgoing).keyboardShortcut("1")

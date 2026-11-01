@@ -70,7 +70,15 @@ final class URLProviderWebSocket: ProviderWebSocket, @unchecked Sendable {
     func cancel() { socket.cancel(with: .goingAway, reason: nil); session.invalidateAndCancel() }
 }
 
-private final class RecognitionMailbox: @unchecked Sendable {
+private /// The Delay shared between the main actor and the upload task.
+final class LivePacing: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = TranslationPacing.balanced
+    func set(_ pacing: TranslationPacing) { lock.lock(); value = pacing; lock.unlock() }
+    func get() -> TranslationPacing { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+final class RecognitionMailbox: @unchecked Sendable {
     struct Entry: Sendable { let id: UUID; let data: Data }
     let stream: AsyncThrowingStream<Entry, Error>
     private let continuation: AsyncThrowingStream<Entry, Error>.Continuation
@@ -102,7 +110,8 @@ private final class RecognitionMailbox: @unchecked Sendable {
     private var failure: String?
     private var segmentID = UUID().uuidString, revision = 0, commits = 0
     private var sourceLanguage: String?
-    private var pacing = TranslationPacing.balanced
+    /// The Delay the sender reads for each packet. Scribe's end-of-speech pause stays as connected.
+    nonisolated private let livePacing = LivePacing()
     private var unresolvedPartial = false, emptyCommitAcknowledged = false
     private var lastTranscriptAt: TimeInterval = 0
     private let finishTimeout: TimeInterval
@@ -111,7 +120,7 @@ private final class RecognitionMailbox: @unchecked Sendable {
     }
     func start(configuration: TranslationConfiguration, credentials: ProviderCredentials) async throws {
         guard !used else { throw BridgeError.unavailable("Create a new recognition session before starting again.") }
-        used = true; sourceLanguage = configuration.sourceLanguage; pacing = configuration.pacing
+        used = true; sourceLanguage = configuration.sourceLanguage; livePacing.set(configuration.pacing)
         var components = URLComponents(string: "wss://api.elevenlabs.io/v1/speech-to-text/realtime")!
         components.queryItems = [.init(name: "model_id", value: "scribe_v2_realtime"), .init(name: "audio_format", value: "pcm_24000"),
                                  .init(name: "commit_strategy", value: "vad"), .init(name: "vad_silence_threshold_secs", value: String(configuration.pacing.commitSilenceSeconds))]
@@ -132,12 +141,14 @@ private final class RecognitionMailbox: @unchecked Sendable {
             if let model = config["model_id"] as? String, model != "scribe_v2_realtime" { throw ProviderNetworkError.invalidResponse }
         } catch { cancel(); throw BridgeError.unavailable("Could not start ElevenLabs recognition. Check your key, account access and network.") }
         active = true; upload.open()
-        let upload = self.upload, mailbox = self.mailbox, pacing = self.pacing
+        let upload = self.upload, mailbox = self.mailbox, pacing = configuration.pacing, livePacing = self.livePacing
         sender = Task.detached { [weak self] in
             var cutter = SegmentCutter(minimumSeconds: pacing.minimumSegmentSeconds, maximumSeconds: pacing.maximumSegmentSeconds,
                                        serviceCommitSeconds: pacing.commitSilenceSeconds)
             do {
                 for await packet in upload.stream {
+                    let current = livePacing.get()
+                    cutter.minimumSeconds = current.minimumSegmentSeconds; cutter.maximumSeconds = current.maximumSegmentSeconds
                     try Task.checkCancellation()
                     guard ProcessInfo.processInfo.systemUptime - packet.admittedAt <= 5 else { throw ProviderNetworkError.overflow }
                     try await socket.send(Self.audioMessage(packet.pcm, commit: cutter.commitAfter(packet.pcm)))
@@ -175,6 +186,7 @@ private final class RecognitionMailbox: @unchecked Sendable {
         }
     }
     nonisolated func append(_ pcm: Data) throws { try upload.append(pcm) }
+    func updatePacing(_ pacing: TranslationPacing) { livePacing.set(pacing) }
     func stopInput() {
         upload.cancel()
         sender?.cancel()

@@ -26,12 +26,15 @@ public struct TranslationConfiguration: Equatable, Sendable {
     public let sourceLanguage: String?
     public let voiceID: String?
     public let pacing: TranslationPacing
+    /// False for text-only translation: composed routes skip speech synthesis.
+    public let speaksTranslation: Bool
     public init(targetLanguage: String = "en", noiseReduction: TranslationNoiseReduction = .nearField,
                 route: TranslationRoute = .openAI, sourceLanguage: String? = nil, voiceID: String? = nil,
-                pacing: TranslationPacing = .balanced) {
+                pacing: TranslationPacing = .balanced, speaksTranslation: Bool = true) {
         self.targetLanguage = targetLanguage
         self.noiseReduction = noiseReduction
         self.route = route; self.sourceLanguage = sourceLanguage; self.voiceID = voiceID; self.pacing = pacing
+        self.speaksTranslation = speaksTranslation
     }
 }
 
@@ -72,6 +75,7 @@ public struct PassageTiming: Equatable, Sendable {
 public struct TranslationEnvelope: Sendable {
     public let event: TranslationEvent
     public let timing: TranslationTiming
+    public init(event: TranslationEvent, timing: TranslationTiming) { self.event = event; self.timing = timing }
 }
 
 public enum TranslationEvent: Equatable, Sendable {
@@ -98,6 +102,7 @@ public typealias TranslationEventHandler = @MainActor @Sendable (TranslationEven
     var onAudio: TranslationAudioHandler? { get set }
     func start(configuration: TranslationConfiguration, apiKey: String) async throws
     func start(configuration: TranslationConfiguration, credentials: ProviderCredentials) async throws
+    func applyLive(_ configuration: TranslationConfiguration) -> Bool
     nonisolated func append(_ pcm: Data) throws
     /// Discard unsent PCM synchronously before optional text-only completion.
     func stopInput()
@@ -106,6 +111,9 @@ public typealias TranslationEventHandler = @MainActor @Sendable (TranslationEven
 }
 
 public extension TranslationProvider {
+    /// Applies a changed configuration to the running session. Returns false when the session
+    /// needs a restart for it.
+    func applyLive(_ configuration: TranslationConfiguration) -> Bool { false }
     func stopInput() { cancel() }
     func start(configuration: TranslationConfiguration, credentials: ProviderCredentials) async throws {
         guard configuration.route == .openAI else { throw BridgeError.unavailable("This adapter only supports the OpenAI translation route.") }

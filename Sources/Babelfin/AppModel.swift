@@ -33,6 +33,7 @@ private final class CaptureAdmission: @unchecked Sendable {
         guard !applyingPreferences else { return }
         if configurationLocked { applyingPreferences = true; targetLanguage = oldValue; applyingPreferences = false; return }
         savedPreferences.targetLanguage = targetLanguage; persistPreferences()
+        settingChanged(.outputLanguage)
     } }
     @Published var route: TranslationRoute = .openAI { didSet {
         guard !applyingPreferences else { return }
@@ -40,16 +41,19 @@ private final class CaptureAdmission: @unchecked Sendable {
         savedPreferences.providerRoute = route.rawValue
         applyingPreferences = true; voiceID = savedPreferences.voices[route.rawValue] ?? ""; applyingPreferences = false
         persistPreferences()
+        settingChanged(.service)
     } }
     @Published var sourceLanguage = "" { didSet {
         guard !applyingPreferences else { return }
         if configurationLocked { applyingPreferences = true; sourceLanguage = oldValue; applyingPreferences = false; return }
         savedPreferences.sourceLanguage = sourceLanguage; persistPreferences()
+        settingChanged(.inputLanguage)
     } }
     @Published var pacing: TranslationPacing = .balanced { didSet {
         guard !applyingPreferences else { return }
         if configurationLocked { applyingPreferences = true; pacing = oldValue; applyingPreferences = false; return }
         savedPreferences.pacing = pacing.rawValue; persistPreferences()
+        settingChanged(.delay)
     } }
     /// The direction's output volume. It never locks: it applies at once, also during translation.
     @Published var outputVolume = 1.0 { didSet {
@@ -59,10 +63,19 @@ private final class CaptureAdmission: @unchecked Sendable {
         audio?.setOutputVolume(Float(outputVolume))
         savedPreferences.outputVolume = outputVolume; persistPreferences()
     } }
+    /// Off: the direction translates to text only (subtitles and transcript), and the original
+    /// audio plays at full volume instead of a translated voice.
+    @Published var speakTranslation = true { didSet {
+        guard !applyingPreferences else { return }
+        if configurationLocked { applyingPreferences = true; speakTranslation = oldValue; applyingPreferences = false; return }
+        savedPreferences.speakTranslation = speakTranslation; persistPreferences()
+        settingChanged(.speech)
+    } }
     @Published var voiceID = "" { didSet {
         guard !applyingPreferences else { return }
         if configurationLocked { applyingPreferences = true; voiceID = oldValue; applyingPreferences = false; return }
         savedPreferences.voices[route.rawValue] = voiceID; persistPreferences()
+        settingChanged(.voice)
     } }
     var onTranscriptEvent: ((UUID, TranslationEvent) -> Void)?
     var onTranscriptSession: ((UUID, Bool, String?) -> Void)?
@@ -79,6 +92,12 @@ private final class CaptureAdmission: @unchecked Sendable {
     @Published private(set) var consumerActive = false
     @Published private(set) var consumerStatus = "Not monitoring"
     @Published private(set) var translationIssue: String?
+    /// Names a key permission that a check found missing after a translation failure.
+    @Published private(set) var keyAdvice: String?
+    /// Checks the keys that a route uses and returns advice for a missing permission. The app
+    /// sets it; offline checks leave it nil, so they send no request.
+    var keyDiagnosis: (@MainActor (TranslationRoute) async -> String?)?
+    private var keyDiagnosisRan = false
     @Published private(set) var reconnecting = false
     @Published private(set) var requiresConsumerResume = false
     @Published var originalMixEnabled = false { didSet {
@@ -153,7 +172,7 @@ private final class CaptureAdmission: @unchecked Sendable {
     private var applyingPreferences = false
     private var inventoryObserver: NSObjectProtocol?
     private var inventory: AudioDeviceInventory?
-    /// True for Meeting audio: with no saved source, Babelfin Speaker becomes the source.
+    /// True for Listen: with no saved source, Babelfin Speaker becomes the source.
     private let selectsMeetingSource: Bool
     private var sessionConfiguration: AppSessionConfiguration?
     private let consumerFactory: (@MainActor () -> any ConsumerMonitoring)?
@@ -175,7 +194,23 @@ private final class CaptureAdmission: @unchecked Sendable {
     private let sleepForControl: @Sendable (TimeInterval) async throws -> Void
     var finishingTranscript: Bool { drainingGeneration != nil }
     var translationEnabled: Bool { !bypass }
-    var configurationLocked: Bool { (locked && !playingOriginalOnly) || microphoneArmed }
+    /// Settings change at any time except while a session starts or stops. During translation a
+    /// change applies at once or waits for Restart (`pendingRestart`).
+    var configurationLocked: Bool { phase == .starting || phase == .stopping || checkingAPI }
+    enum PendingSetting: String, CaseIterable, Identifiable {
+        case service, inputLanguage, outputLanguage, delay, voice, speech, devices
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .service: "Service"; case .inputLanguage: "Input language"; case .outputLanguage: "Output language"
+            case .delay: "Delay"; case .voice: "Voice"; case .speech: "Speak the translation"; case .devices: "Audio devices"
+            }
+        }
+    }
+    /// Settings changed during translation that take effect after Restart.
+    @Published private(set) var pendingRestart: Set<PendingSetting> = []
+    /// A translation service session is connected or connecting.
+    var translating: Bool { active && !bypass }
     /// Original audio with no translation service: settings can change while it plays.
     var playingOriginalOnly: Bool {
         phase == .running && bypass && provider == nil && !reconnecting && failureRecoveryToken == nil && !checkingAPI
@@ -244,6 +279,7 @@ private final class CaptureAdmission: @unchecked Sendable {
         route = TranslationRoute(rawValue: savedPreferences.providerRoute) ?? .openAI
         sourceLanguage = savedPreferences.sourceLanguage
         pacing = TranslationPacing(rawValue: savedPreferences.pacing) ?? .balanced
+        speakTranslation = savedPreferences.speakTranslation
         voiceID = savedPreferences.voices[route.rawValue] ?? ""
         targetLanguage = savedPreferences.targetLanguage
         muted = savedPreferences.explicitlyMuted && !savedPreferences.explicitlyOff
@@ -312,13 +348,63 @@ private final class CaptureAdmission: @unchecked Sendable {
     /// A device change while only original audio plays restarts it on the new devices. When
     /// idle, a new loopback input starts its original audio.
     private func restartOriginalForNewDevices() {
-        if playingOriginalOnly {
+        if translating {
+            pendingRestart.insert(.devices)
+        } else if playingOriginalOnly {
             abortSession()
             refresh()
             Task { [weak self] in await self?.start() }
         } else if !active {
             refresh()
             playLoopbackOriginalIfIdle()
+        }
+    }
+    /// Usage of the current translation session; see UsageStore.
+    private var usageMeter: UsageMeter?
+    private func beginUsage(_ route: TranslationRoute) -> UsageMeter {
+        endUsage()
+        let meter = UsageMeter(route: route)
+        usageMeter = meter
+        UsageStore.shared.begin(meter)
+        return meter
+    }
+    private func endUsage() {
+        if let usageMeter { UsageStore.shared.end(usageMeter) }
+        usageMeter = nil
+    }
+    private func countedSink(_ sink: @escaping TranslationAudioHandler) -> TranslationAudioHandler {
+        guard let meter = usageMeter else { return sink }
+        return { pcm in meter.countReceived(pcm.count); try await sink(pcm) }
+    }
+    /// During translation a changed setting applies at once when the service accepts it;
+    /// otherwise it waits for Restart.
+    private func settingChanged(_ setting: PendingSetting) {
+        guard translating else { return }
+        if [.voice, .outputLanguage, .delay].contains(setting), let provider, provider.applyLive(currentTranslationConfiguration()) {
+            log("\(setting.title) changed without restarting the session.")
+            return
+        }
+        pendingRestart.insert(setting)
+    }
+    /// The translation settings as they are now, for a new or updated session.
+    private func currentTranslationConfiguration() -> TranslationConfiguration {
+        .init(targetLanguage: targetLanguage, noiseReduction: sessionConfiguration?.input.isPhysical == true ? .nearField : .disabled,
+              route: route, sourceLanguage: !route.descriptor.acceptsLanguageHint || sourceLanguage.isEmpty ? nil : sourceLanguage,
+              voiceID: route.descriptor.isDirect || voiceID.isEmpty ? nil : voiceID, pacing: pacing, speaksTranslation: speakTranslation)
+    }
+    /// Applies pending settings. Without a device or speech change, original audio continues while
+    /// the new session connects; otherwise the audio restarts on the new devices.
+    func restartTranslation() async {
+        guard translating, !pendingRestart.isEmpty else { return }
+        let full = pendingRestart.contains(.devices) || pendingRestart.contains(.speech)
+        pendingRestart.removeAll()
+        log("Restarting translation with the new settings.")
+        if full {
+            abortSession()
+            await start()
+        } else {
+            do { try stopTranslating() } catch { fail(error.localizedDescription); return }
+            await connectOnOriginal(automatic: false)
         }
     }
     private func playLoopbackOriginalIfIdle() {
@@ -419,12 +505,13 @@ private final class CaptureAdmission: @unchecked Sendable {
             fail("Choose a supported translation language."); return
         }
         guard bypass || !capabilities.requiresVoiceID || !voiceID.isEmpty else { fail("Choose a voice in Settings first."); return }
-        let configuration = AppSessionConfiguration(destination: destination, input: input, output: output, targetLanguage: targetLanguage, route: route, sourceLanguage: route == .openAI || sourceLanguage.isEmpty ? nil : sourceLanguage, voiceID: route == .openAI || voiceID.isEmpty ? nil : voiceID, pacing: pacing, originalAudio: bypass, originalMixEnabled: originalMixEnabled, originalMixLevel: originalMixLevel, originalMixDucking: originalMixDucking)
+        let configuration = AppSessionConfiguration(destination: destination, input: input, output: output, targetLanguage: targetLanguage, route: route, sourceLanguage: !route.descriptor.acceptsLanguageHint || sourceLanguage.isEmpty ? nil : sourceLanguage, voiceID: route.descriptor.isDirect || voiceID.isEmpty ? nil : voiceID, pacing: pacing, speaksTranslation: speakTranslation, originalAudio: bypass, originalMixEnabled: originalMixEnabled, originalMixLevel: originalMixLevel, originalMixDucking: originalMixDucking)
         sessionConfiguration = configuration
         source = ""; translation = ""; segmentTexts = [:]; segmentOrder = []
         transcriptLanguageName = configuration.targetLanguageName
         let token = UUID(); generation = token
         passageTimings = []
+        keyAdvice = nil; keyDiagnosisRan = false
         phase = .starting
         status = configuration.originalAudio ? "Opening audio source…" : "Connecting to \(configuration.route.displayName)…"
         do {
@@ -445,9 +532,10 @@ private final class CaptureAdmission: @unchecked Sendable {
                     await self.handle(event, sessionID: token)
                 }
                 do {
-                    try await provider.start(configuration: .init(targetLanguage: configuration.targetLanguage, noiseReduction: configuration.input.isPhysical ? .nearField : .disabled, route: configuration.route, sourceLanguage: configuration.sourceLanguage, voiceID: configuration.voiceID, pacing: configuration.pacing), credentials: credentials)
+                    try await provider.start(configuration: .init(targetLanguage: configuration.targetLanguage, noiseReduction: configuration.input.isPhysical ? .nearField : .disabled, route: configuration.route, sourceLanguage: configuration.sourceLanguage, voiceID: configuration.voiceID, pacing: configuration.pacing, speaksTranslation: configuration.speaksTranslation), credentials: credentials)
                 } catch {
                     guard generation == token else { return }
+                    diagnoseKeys(configuration.route)
                     if await recoverOriginalAfterTranslationFailure(error.localizedDescription) { return }
                     throw error
                 }
@@ -456,14 +544,18 @@ private final class CaptureAdmission: @unchecked Sendable {
             let audio = audioFactory()
             self.audio = audio
             audio.setOutputVolume(Float(outputVolume))
-            audio.updateListening(mixEnabled: configuration.originalMixEnabled, level: Float(configuration.originalMixLevel),
-                                  ducking: configuration.originalMixDucking, speechMuted: speechMuted)
-            audio.configureOriginalMix(enabled: configuration.originalMixEnabled, level: Float(configuration.originalMixLevel), ducking: configuration.originalMixDucking)
+            // Text-only translation plays the original at full volume, without ducking.
+            let mixEnabled = configuration.speaksTranslation ? configuration.originalMixEnabled : true
+            let mixLevel = configuration.speaksTranslation ? Float(configuration.originalMixLevel) : 1
+            let mixDucking = configuration.speaksTranslation && configuration.originalMixDucking
+            audio.updateListening(mixEnabled: mixEnabled, level: mixLevel, ducking: mixDucking, speechMuted: speechMuted)
+            audio.configureOriginalMix(enabled: mixEnabled, level: mixLevel, ducking: mixDucking)
             if configuration.originalAudio {
                 audio.onPCM = { [weak audio] pcm in try audio?.play(pcm) }
             } else if let provider {
+                let meter = beginUsage(configuration.route)
                 // Capture owns ordering and bounds through delivery. Never enqueue a UI Task per packet.
-                let admission = CaptureAdmission({ pcm in try provider.append(pcm) }, failure: { [weak self] in
+                let admission = CaptureAdmission({ pcm in try provider.append(pcm); meter.countSent(pcm.count) }, failure: { [weak self] in
                     Task { @MainActor in guard let self, self.generation == token else { return }; await self.handle(.failure("audio_send_failed"), sessionID: token) }
                 })
                 captureAdmission = admission
@@ -483,7 +575,7 @@ private final class CaptureAdmission: @unchecked Sendable {
             }
             try audio.start(input: configuration.input, output: configuration.output, destination: configuration.destination, translated: !configuration.originalAudio)
             guard generation == token, phase == .starting else { audio.stop(); return }
-            if !configuration.originalAudio { provider?.onAudio = audio.translatedSink() }
+            if !configuration.originalAudio { provider?.onAudio = configuration.speaksTranslation ? countedSink(audio.translatedSink()) : { _ in } }
             phase = .running
             if !configuration.originalAudio {
                 recordedSessionID = token
@@ -531,6 +623,7 @@ private final class CaptureAdmission: @unchecked Sendable {
     }
     private func stopTranslating() throws {
         guard phase == .running, let audio else { return }
+        endUsage()
         // Close capture and queued transport input synchronously; device switching never awaits cloud work.
         let endingAdmission = captureAdmission; captureAdmission = nil
         let endingProvider = provider
@@ -598,6 +691,8 @@ private final class CaptureAdmission: @unchecked Sendable {
         drainingGeneration = nil
         level = 0; phase = .idle; status = "Stopped"
         sessionConfiguration = nil
+        pendingRestart.removeAll()
+        endUsage()
         if let endingAudio { log(endingAudio.metricsSummary()) }
     }
     func setMicrophoneArmed(_ enabled: Bool) async {
@@ -718,6 +813,10 @@ private final class CaptureAdmission: @unchecked Sendable {
             guard (try? segment.validate()) != nil else { return }
             let key = "\(role.rawValue):\(segment.id)"
             if let prior = segmentTexts[key]?.1, prior.revision >= segment.revision || (prior.isFinal && !segment.isFinal) { return }
+            if segment.isFinal, segmentTexts[key]?.1.isFinal != true, let route = usageMeter?.route {
+                UsageStore.shared.addText(route: route, recognized: role == .source ? segment.text.count : 0,
+                                          translated: role == .target ? segment.text.count : 0, spoken: speakTranslation)
+            }
             if segmentTexts[key] == nil { segmentOrder.append(key) }
             segmentTexts[key] = (role, segment)
             if segmentOrder.count > 500 { for key in segmentOrder.prefix(segmentOrder.count - 500) { segmentTexts[key] = nil }; segmentOrder = Array(segmentOrder.suffix(500)) }
@@ -739,6 +838,7 @@ private final class CaptureAdmission: @unchecked Sendable {
             // service or the network: it returns to original audio, discards the stale translation and reconnects.
             if code == "audio_playback_failed" { fail(detail) }
             else {
+                if !Self.retryable(code), let route = sessionConfiguration?.route { diagnoseKeys(route) }
                 let recovered = await recoverOriginalAfterTranslationFailure(detail, retry: Self.retryable(code))
                 if !recovered { fail(detail) }
             }
@@ -832,17 +932,18 @@ private final class CaptureAdmission: @unchecked Sendable {
                 if case .failure = event { startupFailure = true }
                 if case .closed = event { startupFailure = true }
             }
-            try await candidate.start(configuration: .init(targetLanguage: targetLanguage, noiseReduction: sessionConfiguration?.input.isPhysical == true ? .nearField : .disabled, route: route, sourceLanguage: route == .openAI || sourceLanguage.isEmpty ? nil : sourceLanguage, voiceID: route == .openAI || voiceID.isEmpty ? nil : voiceID, pacing: pacing), credentials: credentials)
+            try await candidate.start(configuration: currentTranslationConfiguration(), credentials: credentials)
             guard !Task.isCancelled, failureRecoveryToken == operation, !muted, !requiresDeviceResume, !requiresConsumerResume, active, bypass else { candidate.cancel(); return }
             guard nowForControl() < expiresAt else { throw BridgeError.timedOut }
             guard !startupFailure else { throw ProviderNetworkError.transport }
             let token = UUID()
-            let admission = CaptureAdmission({ pcm in try candidate.append(pcm) }, failure: { [weak self] in
+            let meter = beginUsage(route)
+            let admission = CaptureAdmission({ pcm in try candidate.append(pcm); meter.countSent(pcm.count) }, failure: { [weak self] in
                 Task { @MainActor in guard let self, self.generation == token else { return }; await self.handle(.failure("audio_send_failed"), sessionID: token) }
             })
             candidate.onEvent = { [weak self] event in guard let self, self.generation == token || self.drainingGeneration == token else { return }; await self.handle(event, sessionID: token) }
             try audio.switchToTranslation(deliver: { pcm in try admission.append(pcm) })
-            candidate.onAudio = audio.translatedSink()
+            candidate.onAudio = sessionConfiguration?.speaksTranslation == false ? { _ in } : countedSink(audio.translatedSink())
             generation = token; provider = candidate; captureAdmission = admission
             audio.onPCM = { pcm in try admission.append(pcm) }
             bindAudioCallbacks(audio, token: token)
@@ -858,6 +959,19 @@ private final class CaptureAdmission: @unchecked Sendable {
             recoveryDeadline?.cancel(); recoveryDeadline = nil; recoveryTask = nil
             translationIssue = TranslationFailureReason(error: error).safeSummary
             status = "Original audio · translation unavailable. Retry when ready."
+            if !TranslationFailureReason(error: error).isTransient { diagnoseKeys(route) }
+        }
+    }
+    /// Once per session start: a check of the route's keys can name a missing permission that the
+    /// failure itself cannot, because streaming errors carry only a status.
+    private func diagnoseKeys(_ route: TranslationRoute) {
+        guard let keyDiagnosis, !keyDiagnosisRan else { return }
+        keyDiagnosisRan = true
+        let token = generation
+        Task { [weak self] in
+            let advice = await keyDiagnosis(route)
+            guard let self, self.generation == token, let advice else { return }
+            self.keyAdvice = advice; self.log(advice)
         }
     }
     private static func failureMessage(_ code: String) -> String {
@@ -964,8 +1078,8 @@ extension AppModel {
         if requiresConsumerResume { return "Microphone use could not be confirmed. Choose Resume to continue." }
         if reconnecting { return "Original audio continues while translation reconnects." }
         if finishingTranscript { return (active ? "Original audio continues." : "Audio is off.") + " Only the last text updates can still arrive." }
-        if phase == .running, bypass, let translationIssue { return "Original audio continues. \(translationIssue)" }
-        if phase == .failed { return status }
+        if phase == .running, bypass, let translationIssue { return "Original audio continues. \(translationIssue)" + (keyAdvice.map { " " + $0 } ?? "") }
+        if phase == .failed { return status + (keyAdvice.map { " " + $0 } ?? "") }
         if microphoneArmed { return consumerStatus }
         if phase == .idle, status != "Stopped", status != "Audio off" { return status }
         if phase == .running { return bypass ? "Translation is off. No audio is sent to a translation service." : "\(selectedInputName) → \(selectedOutputName)" }
@@ -973,7 +1087,7 @@ extension AppModel {
         return "Choose Translate when you are ready."
     }
     var languageSummary: String {
-        let source = route == .openAI || sourceLanguage.isEmpty ? "Automatic" : (capabilities.inputLanguages.first { $0.code == sourceLanguage }?.name ?? "Choose input language")
+        let source = !route.descriptor.acceptsLanguageHint || sourceLanguage.isEmpty ? "Automatic" : (capabilities.inputLanguages.first { $0.code == sourceLanguage }?.name ?? "Choose input language")
         return "\(source) → \(targetLanguageName)"
     }
     var translationSummary: String {
@@ -982,9 +1096,7 @@ extension AppModel {
     var requiredAccountNames: String {
         ProviderService.allCases.filter { route.requiredServices.contains($0) }.map { Self.serviceName($0) }.joined(separator: ", ")
     }
-    static func serviceName(_ service: ProviderService) -> String {
-        switch service { case .openAI: return "OpenAI"; case .elevenLabs: return "ElevenLabs"; case .fish: return "Fish Audio" }
-    }
+    static func serviceName(_ service: ProviderService) -> String { service.displayName }
     var setupRequirements: [String] {
         var items: [String] = []
         if !inputAvailable { items.append(inputUID.isEmpty ? "Choose an audio source." : "Reconnect the selected audio source.") }
@@ -993,7 +1105,7 @@ extension AppModel {
             if accountPresence[service] == false { items.append("Add a \(Self.serviceName(service)) API key in Accounts.") }
         }
         if !capabilities.outputLanguages.contains(where: { $0.code == targetLanguage }) { items.append("Choose an output language for this service.") }
-        if route != .openAI && !sourceLanguage.isEmpty && !capabilities.inputLanguages.contains(where: { $0.code == sourceLanguage }) { items.append("Choose an input language for this service.") }
+        if route.descriptor.acceptsLanguageHint && !sourceLanguage.isEmpty && !capabilities.inputLanguages.contains(where: { $0.code == sourceLanguage }) { items.append("Choose an input language for this service.") }
         if capabilities.requiresVoiceID && voiceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { items.append("Choose a voice in Settings.") }
         if !inputUID.isEmpty && inputUID == outputUID { items.append("Choose different input and output devices to avoid feedback.") }
         return items

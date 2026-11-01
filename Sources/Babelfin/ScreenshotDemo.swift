@@ -12,6 +12,12 @@ import BridgeCore
         AudioDevice(id: 9003, uid: "demo-BlackHole2ch", name: "BlackHole 2ch", inputChannels: 2, outputChannels: 2, transport: kAudioDeviceTransportTypeVirtual),
         AudioDevice(id: 9004, uid: "demo-BlackHole16ch", name: "BlackHole 16ch", inputChannels: 16, outputChannels: 16, transport: kAudioDeviceTransportTypeVirtual)
     ]
+    static func tools() -> SpeechToolsModel {
+        let model = SpeechToolsModel(previewDeviceList: { devices }, keyPresence: { _ in true }, credentialVersion: { "demo" },
+                                     loadCredentials: { _ in throw BridgeError.unavailable("Demo") })
+        model.seedDemoVoiceClip()
+        return model
+    }
     static func conversation() -> ConversationModel {
         VoiceNameCache.remember([ProviderVoice(id: "demovoice", name: "Kari", provider: .elevenLabs, state: "available", isReady: true)])
         var outgoingPreferences = AppPreferences()
@@ -23,7 +29,7 @@ import BridgeCore
         outgoingPreferences.voices = [TranslationRoute.elevenLabs.rawValue: "demovoice"]
         var incomingPreferences = AppPreferences()
         incomingPreferences.destination = AudioDestination.listen.rawValue
-        incomingPreferences.providerRoute = TranslationRoute.fish.rawValue
+        incomingPreferences.providerRoute = TranslationRoute.gemini.rawValue
         incomingPreferences.sourceLanguage = "en"; incomingPreferences.targetLanguage = "no"
         incomingPreferences.listen = SavedAudioRoute(input: SavedAudioDevice(uid: "demo-BlackHole16ch", name: "BlackHole 16ch"),
                                                      output: SavedAudioDevice(uid: "demo-headphones", name: "Headphones"))

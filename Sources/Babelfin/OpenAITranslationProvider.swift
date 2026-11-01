@@ -25,7 +25,7 @@ final class URLTranslationWebSocket: TranslationWebSocket, @unchecked Sendable {
     }
     var messageLimitForChecks: Int { socket.maximumMessageSize }
     #endif
-    private init(request: URLRequest) {
+    init(request: URLRequest) {
         let settings = URLSessionConfiguration.ephemeral
         settings.urlCache = nil
         settings.httpCookieStorage = nil
@@ -77,10 +77,51 @@ private final class AudioSink: @unchecked Sendable {
     func get() -> TranslationAudioHandler? { lock.lock(); defer { lock.unlock() }; return handler }
 }
 
-@MainActor final class OpenAITranslationProvider: TranslationProvider {
+/// One direct speech-to-speech service's message format. A wire belongs to one session; it may
+/// keep state, such as a resampler.
+protocol RealtimeTranslationWire: AnyObject, Sendable {
+    var service: ProviderService { get }
+    func request(credential: String) -> URLRequest
+    /// Messages sent right after the connection opens.
+    func opening(_ configuration: TranslationConfiguration) throws -> [String]
+    /// The message sent when the server reports `.created`; nil when the opening messages configure the session.
+    func update(_ configuration: TranslationConfiguration) throws -> String?
+    /// The session is ready only after `.created` and then `.updated`.
+    var waitsForCreated: Bool { get }
+    func decode(_ data: Data) throws -> [TranslationEnvelope]
+    func append(_ pcm: Data) throws -> String
+    /// The message that ends input gracefully, if the service has one.
+    var closing: String? { get }
+    /// The server answers the closing message with `.closed`.
+    var confirmsClose: Bool { get }
+}
+
+final class OpenAIRealtimeWire: RealtimeTranslationWire, @unchecked Sendable {
+    let service = ProviderService.openAI
+    func request(credential: String) -> URLRequest {
+        var request = URLRequest(url: TranslationWire.endpoint)
+        request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 20
+        return request
+    }
+    func opening(_ configuration: TranslationConfiguration) throws -> [String] { [] }
+    func update(_ configuration: TranslationConfiguration) throws -> String? { try TranslationWire.update(configuration) }
+    let waitsForCreated = true
+    func decode(_ data: Data) throws -> [TranslationEnvelope] { [try TranslationWire.decodeEnvelope(data)] }
+    func append(_ pcm: Data) throws -> String { try TranslationWire.append(pcm) }
+    let closing: String? = "{\"type\":\"session.close\"}"
+    let confirmsClose = true
+}
+
+typealias OpenAITranslationProvider = RealtimeTranslationProvider
+
+/// A direct speech-to-speech session over one WebSocket. The wire supplies the service's format;
+/// upload bounds, failure classes, health checks and shutdown are shared.
+@MainActor final class RealtimeTranslationProvider: TranslationProvider {
     var onEvent: TranslationEventHandler?
     var onAudio: TranslationAudioHandler? { didSet { audioSink.set(onAudio) } }
     nonisolated private let audioSink = AudioSink()
+    private let wire: any RealtimeTranslationWire
     private let makeSocket: @Sendable (String) -> any TranslationWebSocket
     private let now: @Sendable () -> TimeInterval
     private var socket: (any TranslationWebSocket)?
@@ -103,16 +144,24 @@ private final class AudioSink: @unchecked Sendable {
     private var expiresAt: TimeInterval?
     private var warnedExpiration = false
 
-    init(transportFactory: @escaping @Sendable (String) -> any TranslationWebSocket = { URLTranslationWebSocket(apiKey: $0) },
+    init(wire: any RealtimeTranslationWire = OpenAIRealtimeWire(),
+         transportFactory: (@Sendable (String) -> any TranslationWebSocket)? = nil,
          clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
-        makeSocket = transportFactory; now = clock
+        self.wire = wire
+        makeSocket = transportFactory ?? { [wire] in URLTranslationWebSocket(request: wire.request(credential: $0)) }
+        now = clock
+    }
+
+    func start(configuration: TranslationConfiguration, credentials: ProviderCredentials) async throws {
+        try await start(configuration: configuration, apiKey: credentials.require(wire.service))
     }
 
     func start(configuration: TranslationConfiguration, apiKey: String) async throws {
         guard !started else { throw BridgeError.unavailable("Create a fresh translation session before starting again.") }
         started = true
         let token = generation
-        let update = try TranslationWire.update(configuration)
+        let wire = self.wire
+        let opening = try wire.opening(configuration), update = try wire.update(configuration)
         let socket = makeSocket(apiKey)
         self.socket = socket
         let deadline = Task {
@@ -121,24 +170,26 @@ private final class AudioSink: @unchecked Sendable {
         }
         defer { deadline.cancel() }
         do {
-            var gotCreated = false
+            for message in opening { try await socket.send(message) }
+            var gotCreated = !wire.waitsForCreated
             while !ready {
-                let envelope = try await Self.readEvent(socket)
-                guard token == generation, !closing, !Task.isCancelled else { throw CancellationError() }
-                if let expiry = envelope.timing.expiresAt { expiresAt = expiry }
-                switch envelope.event {
-                case .created where !gotCreated:
-                    gotCreated = true
-                    try await socket.send(update)
-                case .updated where gotCreated: ready = true
-                case .failure, .closed: throw BridgeError.unavailable("OpenAI rejected or closed the session.")
-                default: break
+                for envelope in try await Self.readEvents(socket, wire) where !ready {
+                    guard token == generation, !closing, !Task.isCancelled else { throw CancellationError() }
+                    if let expiry = envelope.timing.expiresAt { expiresAt = expiry }
+                    switch envelope.event {
+                    case .created where !gotCreated:
+                        gotCreated = true
+                        if let update { try await socket.send(update) }
+                    case .updated where gotCreated: ready = true
+                    case .failure, .closed: throw BridgeError.unavailable("The service rejected or closed the session.")
+                    default: break
+                    }
                 }
             }
             guard token == generation, !closing, !Task.isCancelled else { throw CancellationError() }
         } catch {
             cancel()
-            throw BridgeError.unavailable("Could not configure OpenAI translation. Check the API key, billing, model access, and network.")
+            throw BridgeError.unavailable("Could not configure \(wire.service.displayName) translation. Check the API key, billing, model access, and network.")
         }
         upload.open(); received.open()
         lastReport = now()
@@ -148,7 +199,7 @@ private final class AudioSink: @unchecked Sendable {
                 for await packet in upload.stream {
                     guard !Task.isCancelled else { return }
                     guard clock() - packet.admittedAt <= 5 else { throw BridgeError.uploadBacklog }
-                    try await socket.send(TranslationWire.append(packet.pcm))
+                    try await socket.send(wire.append(packet.pcm))
                     upload.complete(packet)
                 }
             } catch {
@@ -191,7 +242,7 @@ private final class AudioSink: @unchecked Sendable {
         reader = Task.detached { [weak self] in
             do {
                 while !Task.isCancelled {
-                    let envelope = try await Self.readEvent(socket)
+                  for envelope in try await Self.readEvents(socket, wire) {
                     guard !Task.isCancelled else { return }
                     if case .audio(let pcm) = envelope.event {
                         let instant = clock()
@@ -212,6 +263,7 @@ private final class AudioSink: @unchecked Sendable {
                         if case .failure = envelope.event { socket.cancel(); controls.finish(); return }
                         if case .closed = envelope.event { controls.finish(); return }
                     }
+                  }
                 }
             } catch {
                 guard !Task.isCancelled else { return }
@@ -226,10 +278,10 @@ private final class AudioSink: @unchecked Sendable {
             }
         }
     }
-    nonisolated private static func readEvent(_ socket: any TranslationWebSocket) async throws -> TranslationEnvelope {
+    nonisolated private static func readEvents(_ socket: any TranslationWebSocket, _ wire: any RealtimeTranslationWire) async throws -> [TranslationEnvelope] {
         let data = try await socket.receive()
         guard data.count <= 400_000 else { throw BridgeError.invalidEvent }
-        return try TranslationWire.decodeEnvelope(data)
+        return try wire.decode(data)
     }
     nonisolated func append(_ pcm: Data) throws { try upload.append(pcm) }
     private func receiveOverflow(oversized: Bool, token: UUID) async -> Bool {
@@ -302,9 +354,14 @@ private final class AudioSink: @unchecked Sendable {
         await sender?.value
         if token == generation {
             do {
-                try await socket.send("{\"type\":\"session.close\"}")
-                await reader?.value
-                await controlConsumer?.value
+                if let closing = wire.closing { try await socket.send(closing) }
+                if wire.confirmsClose {
+                    await reader?.value
+                    await controlConsumer?.value
+                } else {
+                    // No close confirmation: allow the last transcript events to arrive.
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                }
             } catch { await fail("finalization_failed", token: token) }
         }
         deadline.cancel()

@@ -237,12 +237,25 @@ private final class PreparedSpeech: @unchecked Sendable {
         self.recognizer = recognizer; self.translator = translator; self.synthesizer = synthesizer
         self.policy = policy; self.now = clock
     }
+    /// The voice, the output language and Delay apply from the next passage; the route, the input
+    /// language and Speak the translation need a new session.
+    func applyLive(_ next: TranslationConfiguration) -> Bool {
+        guard state == .running, next.route == configuration.route, next.sourceLanguage == configuration.sourceLanguage,
+              next.speaksTranslation == configuration.speaksTranslation,
+              (try? ProviderCapabilities.forRoute(next.route).validate(next)) != nil else { return false }
+        if next.pacing != configuration.pacing {
+            policy.targetLag = next.pacing.targetLagSeconds
+            recognizer.updatePacing(next.pacing)
+        }
+        configuration = next
+        return true
+    }
     func start(configuration: TranslationConfiguration, apiKey: String) async throws {
         throw BridgeError.unavailable("This composed route needs separate service credentials from Settings.")
     }
     func start(configuration: TranslationConfiguration, credentials: ProviderCredentials) async throws {
         guard state == .fresh else { throw BridgeError.unavailable("Create a fresh translation session before starting again.") }
-        guard configuration.route != .openAI else { throw BridgeError.unavailable("Use the direct OpenAI adapter for this route.") }
+        guard !configuration.route.descriptor.isDirect else { throw BridgeError.unavailable("Use the direct adapter for this route.") }
         try ProviderCapabilities.forRoute(configuration.route).validate(configuration)
         try credentials.validate(for: configuration.route)
         self.configuration = configuration; self.credentials = credentials
@@ -325,7 +338,7 @@ private final class PreparedSpeech: @unchecked Sendable {
         let preparation = Task { @MainActor [synthesizer, gate, policy, now] in
             do {
                 let text = try await pending.value
-                guard !gate.outputDetached, !Task.isCancelled else { speech.finish(CancellationError()); return }
+                guard !gate.outputDetached, request.speaksTranslation, !Task.isCancelled else { speech.finish(CancellationError()); return }
                 stamps.mark("voice", now())
                 try await CompositionDeadline<Void>().run(seconds: policy.stageTimeout) {
                     try await synthesizer.synthesize(text: text, language: request.targetLanguage, voiceID: request.voiceID,
@@ -378,7 +391,7 @@ private final class PreparedSpeech: @unchecked Sendable {
                 speaking = true
                 startLookahead()
                 defer { speaking = false }
-                if !gate.outputDetached {
+                if !gate.outputDetached && request.speaksTranslation {
                     synthesizing = true
                     let lag = now() - job.arrived
                     let rate = policy.speakingRate(lag: lag, previous: lastRate, waiting: waiting.oldest != nil)

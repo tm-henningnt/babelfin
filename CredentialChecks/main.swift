@@ -74,11 +74,11 @@ private func fixture(_ directory: URL) -> LocalCredentialStore { LocalCredential
             if service == .elevenLabs { throw LocalCredentialError.unavailable }
         }
         try expect(calls.map { $0.0 } == ProviderService.allCases && calls.allSatisfy { $0.1 == .localFile }, "Remove all targets every provider in only the confirmed store")
-        try expect(result.failed == [.elevenLabs] && Set(result.removed) == [.openAI, .fish], "Partial failure preserves successful removal results")
+        try expect(result.failed == [.elevenLabs] && Set(result.removed) == Set(ProviderService.allCases).subtracting([.elevenLabs]), "Partial failure preserves successful removal results")
         let complete = KeychainStore.removeAll(storage: .keychain) { _, storage in
             try expect(storage == .keychain, "Explicit Keychain removal does not fall back")
         }
-        try expect(complete.failed.isEmpty && complete.removed.count == 3, "All-success result")
+        try expect(complete.failed.isEmpty && complete.removed.count == ProviderService.allCases.count, "All-success result")
         print("PASS: injected removal is scoped and partial failures remain visible without real stores")
         let activity = CredentialOperationActivity()
         let first = activity.begin(), second = activity.begin()

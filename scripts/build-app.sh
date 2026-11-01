@@ -59,7 +59,35 @@ if [[ "${BABELFIN_BUNDLE_DRIVERS:-0}" == 1 ]]; then
     done
     cp -X Drivers/BabelfinLoopback/upstream/LICENSE "$DRIVERS/GPL-3.0.txt"
 fi
+# Microsoft's Speech SDK for the Azure route, when scripts/fetch-azure-speech-sdk.sh fetched it.
+# Release bundles allow no symbolic links, so the framework's arm64 library is embedded as a
+# plain dylib: the app's reference is rewritten to it, and it is re-signed below. Microsoft's
+# terms travel with it.
+SDK=Vendor/AzureSpeech/MicrosoftCognitiveServicesSpeech.xcframework/macos-arm64_x86_64/MicrosoftCognitiveServicesSpeech.framework
+FRAMEWORK_REF="@rpath/MicrosoftCognitiveServicesSpeech.framework/Versions/A/MicrosoftCognitiveServicesSpeech"
+LIBRARY="$APP/Contents/Frameworks/libMicrosoftCognitiveServicesSpeech.dylib"
+if otool -L "$APP/Contents/MacOS/Babelfin" | grep -q "$FRAMEWORK_REF"; then
+    [[ -d "$SDK" ]] || { printf 'The build links the Azure Speech SDK, but Vendor/AzureSpeech is missing.\n' >&2; exit 1; }
+    if [[ -n "$LOCAL_IDENTITY" ]]; then
+        # A local certificate has no Team ID, so library validation would refuse the SDK and the app
+        # would not launch. Owner decision: such builds are signed ad-hoc, as releases are.
+        printf 'The Azure Speech SDK is included, so this local build is signed ad-hoc instead of with the local certificate.\n'
+        LOCAL_IDENTITY=""
+        IDENTITY="-"
+    fi
+    mkdir -p "$APP/Contents/Frameworks"
+    lipo -thin arm64 "$SDK/Versions/A/MicrosoftCognitiveServicesSpeech" -output "$LIBRARY"
+    install_name_tool -id "@rpath/libMicrosoftCognitiveServicesSpeech.dylib" "$LIBRARY" 2>/dev/null
+    install_name_tool -change "$FRAMEWORK_REF" "@rpath/libMicrosoftCognitiveServicesSpeech.dylib" "$APP/Contents/MacOS/Babelfin" 2>/dev/null
+    mkdir -p "$APP/Contents/Resources/Microsoft Speech SDK"
+    cp -X Vendor/AzureSpeech/LICENSE.md Vendor/AzureSpeech/ThirdPartyNotices.md "$APP/Contents/Resources/Microsoft Speech SDK/"
+fi
 xattr -cr "$APP"
+# The hardened runtime loads only libraries from the same signer, so the SDK is re-signed first.
+if [[ -f "$LIBRARY" ]]; then
+    if [[ "$IDENTITY" == "-" ]]; then codesign --force --sign - "$LIBRARY"
+    else codesign --force --options runtime --timestamp --sign "$IDENTITY" "$LIBRARY"; fi
+fi
 if [[ -n "$LOCAL_IDENTITY" ]]; then
     codesign --force --options runtime --timestamp=none --entitlements Resources/Babelfin.entitlements --sign "$LOCAL_IDENTITY" "$APP"
     printf 'Locally certificate-signed development build; not notarized.\n'

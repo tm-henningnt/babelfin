@@ -62,11 +62,20 @@ def remote_tag(tag):
         raise ValueError('Expected a lightweight release tag pointing directly at the reviewed commit')
     return response['object']['sha']
 
+def release_for_tag(tag):
+    """The one release with this tag, draft or published. GitHub's by-tag lookup omits drafts."""
+    pages = json.loads(command(['gh', 'api', f'repos/{PUBLIC_REPOSITORY}/releases?per_page=100', '--paginate', '--slurp']))
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise ValueError('Cannot read the remote release inventory')
+    matches = [release for page in pages for release in page if isinstance(release, dict) and release.get('tag_name') == tag]
+    if len(matches) != 1: raise ValueError('Expected exactly one remote release for the reviewed tag')
+    return matches[0]
+
 def verify_remote_assets(manifest, commit, draft, allow_missing=False):
     validate_identity(manifest)
     if not re.fullmatch(r'[0-9a-f]{40}', commit) or remote_tag(manifest['tag']) != commit:
         raise ValueError('Remote tag differs from the reviewed public commit')
-    response = json.loads(command(['gh', 'api', f"repos/{PUBLIC_REPOSITORY}/releases/tags/{manifest['tag']}"]))
+    response = release_for_tag(manifest['tag'])
     if (draft is not None and response['draft'] is not draft) or response['tag_name'] != manifest['tag']:
         raise ValueError('Unexpected remote release state')
     if response.get('prerelease') or response.get('name') != f"Babelfin {manifest['version']}" or digest(response.get('body', '').encode()) != manifest['notesSHA256']:

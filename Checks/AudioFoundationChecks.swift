@@ -305,8 +305,8 @@ enum AudioFoundationChecks {
                    "The original must keep full level until translated speech plays")
         mixed.startPlayback()
         renderedMix.withUnsafeMutableBufferPointer { mixed.render(into: $0) }
-        try expect(renderedMix[0] > 0.39 / 1.5 && abs(renderedMix[239] - 0.23 / 1.5) < 0.002,
-                   "Duck attack must follow actually rendered translated samples")
+        try expect(renderedMix[0] > 0.39 / 1.5 && abs(renderedMix[239] - (0.2 + 0.2 * (1 - 0.6 * 240 / 3600)) / 1.5) < 0.002,
+                   "Duck attack must follow actually rendered translated samples over 150 ms")
         mixed.retireRenderedCompletions()
         try expect(mixedQueue.queuedFrames == 480, "Partial render must not retire an entire buffer")
         renderedMix.withUnsafeMutableBufferPointer { mixed.render(into: $0) }
@@ -314,7 +314,12 @@ enum AudioFoundationChecks {
         try expect(mixedQueue.queuedFrames == 0, "Actual full render must release translated reservation")
         // Drive the actual source through its hold+release instead of advancing wall time.
         var releaseOutput = [Float](repeating: 0, count: 240)
-        for _ in 0..<36 {
+        for _ in 0..<50 {
+            try mixed.appendOriginal(PCM16.encode([Float](repeating: 0.4, count: 240)))
+            releaseOutput.withUnsafeMutableBufferPointer { mixed.render(into: $0) }
+        }
+        try expect(abs(releaseOutput[239] - 0.2 * 0.4 / 1.5) < 0.002, "Ducking must hold the original down through a pause shorter than 1 s")
+        for _ in 0..<120 {
             try mixed.appendOriginal(PCM16.encode([Float](repeating: 0.4, count: 240)))
             releaseOutput.withUnsafeMutableBufferPointer { mixed.render(into: $0) }
         }

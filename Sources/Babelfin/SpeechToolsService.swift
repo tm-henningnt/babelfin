@@ -1,12 +1,19 @@
+import AVFoundation
 import Foundation
 import BridgeCore
 
 /// Batch recognition is a separate seam from a continuously running microphone recognizer.
 @MainActor protocol SpeechToolsTranscriber: AnyObject {
     var requiredServices: Set<ProviderService> { get }
-    func transcribe(fileURL: URL, sourceLanguage: String?, diarize: Bool,
+    func transcribe(source: RecordingSource, sourceLanguage: String?, diarize: Bool,
                     credentials: ProviderCredentials) async throws -> RecordingTranscript
     func cancel()
+}
+extension SpeechToolsTranscriber {
+    func transcribe(fileURL: URL, sourceLanguage: String?, diarize: Bool,
+                    credentials: ProviderCredentials) async throws -> RecordingTranscript {
+        try await transcribe(source: .file(fileURL), sourceLanguage: sourceLanguage, diarize: diarize, credentials: credentials)
+    }
 }
 
 /// Explicit, single-operation tools. File selection, initialization and cancellation never upload.
@@ -18,6 +25,7 @@ import BridgeCore
     private let translator: any TextTranslationStage
     private let elevenSynthesis: any SpeechSynthesisStage
     private let fishSynthesis: any SpeechSynthesisStage
+    private let voiceChanger: ElevenLabsVoiceChanger
     private let operationTimeout: TimeInterval
     private var operation: ProviderCancellation?
     private var expired = false
@@ -31,15 +39,20 @@ import BridgeCore
         self.translator = translator ?? OpenAITextTranslationStage(transport: transport)
         self.elevenSynthesis = elevenSynthesis ?? ElevenLabsSpeechSynthesisStage(transport: transport)
         self.fishSynthesis = fishSynthesis ?? FishSpeechSynthesisStage(transport: transport)
+        self.voiceChanger = ElevenLabsVoiceChanger(transport: transport)
         self.operationTimeout = operationTimeout.isFinite ? min(600, max(0.01, operationTimeout)) : 600
     }
 
     func transcribe(fileURL: URL, sourceLanguage: String? = nil, diarize: Bool = true,
                     credentials: ProviderCredentials) async throws -> RecordingTranscript {
+        try await transcribe(source: .file(fileURL), sourceLanguage: sourceLanguage, diarize: diarize, credentials: credentials)
+    }
+    func transcribe(source: RecordingSource, sourceLanguage: String? = nil, diarize: Bool = true,
+                    credentials: ProviderCredentials) async throws -> RecordingTranscript {
         for service in transcriber.requiredServices { _ = try credentials.require(service) }
         return try await perform { token in
             self.onProgress?(.init(stage: .transcription, completed: 0, total: 1)); try token.check()
-            let result = try await self.transcriber.transcribe(fileURL: fileURL, sourceLanguage: sourceLanguage,
+            let result = try await self.transcriber.transcribe(source: source, sourceLanguage: sourceLanguage,
                                                                diarize: diarize, credentials: credentials)
             try token.check(); try result.validate()
             self.onProgress?(.init(stage: .transcription, completed: 1, total: 1))
@@ -106,10 +119,10 @@ import BridgeCore
 
     /// Returns a complete WAV for an explicit save/preview action; never plays or writes a file.
     func voiceClip(text: String, language: String, voiceID: String?, route: TranslationRoute,
-                   credentials: ProviderCredentials) async throws -> Data {
+                   direction: SpeechDirection = .standard, credentials: ProviderCredentials) async throws -> Data {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SpeechToolsError.emptyText }
         guard text.count <= SpeechToolsLimits.voiceCharacters, text.utf8.count <= 8_000 else { throw SpeechToolsError.clipTooLong }
-        guard route != .openAI else { throw SpeechToolsError.unsupportedVoiceProvider }
+        guard route.descriptor.speechService != nil else { throw SpeechToolsError.unsupportedVoiceProvider }
         try validateProviderToken(language)
         if route == .elevenLabs, voiceID == nil { throw BridgeError.unavailable("Choose an ElevenLabs voice in Settings.") }
         _ = try credentials.require(route == .elevenLabs ? .elevenLabs : .fish)
@@ -117,7 +130,7 @@ import BridgeCore
             self.onProgress?(.init(stage: .voiceClip, completed: 0, total: 1)); try token.check()
             let audio = SpeechToolsBuffer(maximumBytes: SpeechToolsLimits.voicePCMBytes)
             let stage = route == .elevenLabs ? self.elevenSynthesis : self.fishSynthesis
-            try await stage.synthesize(text: text, language: language, voiceID: voiceID, credentials: credentials) { bytes in
+            try await stage.synthesize(text: text, language: language, voiceID: voiceID, direction: direction, credentials: credentials) { bytes in
                 try token.check(); try Task.checkCancellation(); try audio.append(bytes)
             }
             try token.check(); try Task.checkCancellation()
@@ -127,10 +140,66 @@ import BridgeCore
         }
     }
 
+    /// Speaks each translated segment at its original time and returns one WAV. With
+    /// `includeOriginal`, the original recording plays under the dub and ducks as in live translation.
+    func dub(transcript: RecordingTranscript, source: RecordingSource, includeOriginal: Bool, originalLevel: Float,
+             voiceID: String?, route: TranslationRoute, direction: SpeechDirection,
+             credentials: ProviderCredentials) async throws -> Data {
+        try transcript.validate()
+        guard let language = transcript.targetLanguage else { throw SpeechToolsError.emptyText }
+        try validateProviderToken(language)
+        let segments = transcript.segments.filter { !($0.translatedText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !segments.isEmpty else { throw SpeechToolsError.emptyText }
+        guard segments.allSatisfy({ $0.startSeconds != nil }) else { throw SpeechToolsError.dubUntimed }
+        guard (segments.compactMap(\.endSeconds).max() ?? 0) <= SpeechToolsLimits.dubSeconds else { throw SpeechToolsError.dubTooLong }
+        guard route.descriptor.speechService != nil else { throw SpeechToolsError.unsupportedVoiceProvider }
+        if route == .elevenLabs, voiceID == nil { throw BridgeError.unavailable("Choose an ElevenLabs voice in Settings.") }
+        _ = try credentials.require(route == .elevenLabs ? .elevenLabs : .fish)
+        let ordered = segments.sorted { ($0.startSeconds ?? 0) < ($1.startSeconds ?? 0) }
+        return try await perform { token in
+            let stage = route == .elevenLabs ? self.elevenSynthesis : self.fishSynthesis
+            var passages: [Data] = []
+            self.onProgress?(.init(stage: .dub, completed: 0, total: ordered.count))
+            for segment in ordered {
+                try token.check(); try Task.checkCancellation()
+                let audio = SpeechToolsBuffer(maximumBytes: SpeechToolsLimits.voicePCMBytes)
+                try await stage.synthesize(text: segment.translatedText ?? "", language: language, voiceID: voiceID,
+                                           direction: direction, credentials: credentials) { bytes in
+                    try token.check(); try Task.checkCancellation(); try audio.append(bytes)
+                }
+                passages.append(audio.data())
+                self.onProgress?(.init(stage: .dub, completed: passages.count, total: ordered.count))
+            }
+            try token.check()
+            let slots = zip(ordered, passages).map { DubTimeline.Slot(start: $0.startSeconds ?? 0, duration: Double($1.count) / 2 / 24_000) }
+            let original = includeOriginal ? try RecordingAudioDecoder.pcm24k(source, maximumSeconds: SpeechToolsLimits.dubSeconds) : nil
+            let pcm = try DubRenderer.render(passages: passages, placements: DubTimeline.place(slots),
+                                             original: original, originalLevel: originalLevel)
+            return try SpeechToolsWAV.encode(pcm: pcm, maximumBytes: SpeechToolsLimits.dubPCMBytes)
+        }
+    }
+
+    /// Speaks a microphone recording again with an ElevenLabs voice and returns a WAV.
+    func revoice(wav: Data, voiceID: String, delivery: SpeechDirection.Delivery,
+                 credentials: ProviderCredentials) async throws -> Data {
+        guard wav.count <= SpeechToolsLimits.voicePCMBytes + 44 else { throw SpeechToolsError.revoiceTooLong }
+        _ = try credentials.require(.elevenLabs)
+        return try await perform { token in
+            self.onProgress?(.init(stage: .voiceClip, completed: 0, total: 1)); try token.check()
+            let audio = SpeechToolsBuffer(maximumBytes: SpeechToolsLimits.voicePCMBytes)
+            try await self.voiceChanger.revoice(wav: wav, voiceID: voiceID, delivery: delivery, credentials: credentials) { bytes in
+                try token.check(); try Task.checkCancellation(); try audio.append(bytes)
+            }
+            try token.check()
+            self.onProgress?(.init(stage: .voiceClip, completed: 1, total: 1))
+            return try SpeechToolsWAV.encode(pcm: audio.data())
+        }
+    }
+
     func cancel() {
         guard operation != nil else { return }
         operation?.cancel(); transport.cancel(); transcriber.cancel(); translator.cancel()
-        elevenSynthesis.cancel(); fishSynthesis.cancel()
+        elevenSynthesis.cancel(); fishSynthesis.cancel(); voiceChanger.cancel()
     }
 
     private func perform<Value: Sendable>(_ body: @MainActor (ProviderCancellation) async throws -> Value) async throws -> Value {
@@ -183,7 +252,7 @@ import BridgeCore
     private let transport: any ProviderHTTPTransport
     private var operation: ProviderCancellation?
     init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport()) { self.transport = transport }
-    func transcribe(fileURL: URL, sourceLanguage: String?, diarize: Bool,
+    func transcribe(source: RecordingSource, sourceLanguage: String?, diarize: Bool,
                     credentials: ProviderCredentials) async throws -> RecordingTranscript {
         guard operation == nil else { throw ProviderNetworkError.busy }
         if let sourceLanguage {
@@ -193,7 +262,7 @@ import BridgeCore
         let key = try credentials.require(.elevenLabs)
         let token = ProviderCancellation(); operation = token; defer { operation = nil }
         var request = try await Task.detached {
-            try Self.uploadRequest(fileURL: fileURL, sourceLanguage: sourceLanguage, diarize: diarize, token: token)
+            try Self.uploadRequest(source: source, sourceLanguage: sourceLanguage, diarize: diarize, token: token)
         }.value
         try token.check(); try Task.checkCancellation()
         request.setValue(key, forHTTPHeaderField: "xi-api-key")
@@ -212,13 +281,13 @@ import BridgeCore
     }
     func cancel() { operation?.cancel(); transport.cancel() }
 
-    nonisolated private static func uploadRequest(fileURL: URL, sourceLanguage: String?, diarize: Bool,
+    nonisolated private static func uploadRequest(source: RecordingSource, sourceLanguage: String?, diarize: Bool,
                                                   token: ProviderCancellation) throws -> URLRequest {
-        guard fileURL.isFileURL else { throw SpeechToolsError.invalidRecording }
-        let ext = fileURL.pathExtension.lowercased()
         let types = ["wav": "audio/wav", "mp3": "audio/mpeg", "m4a": "audio/mp4", "mp4": "video/mp4",
                      "flac": "audio/flac", "ogg": "audio/ogg", "webm": "audio/webm"]
-        guard let mime = types[ext] else { throw SpeechToolsError.unsupportedFormat }
+        if case .file(let url) = source, url.isFileURL, types[url.pathExtension.lowercased()] == nil { throw SpeechToolsError.unsupportedFormat }
+        let audio = try source.upload(check: token.check)
+        guard let mime = types[audio.fileExtension] else { throw SpeechToolsError.unsupportedFormat }
         let boundary = "Babelfin-" + UUID().uuidString
         var body = Data()
         func field(_ key: String, _ value: String) {
@@ -229,25 +298,8 @@ import BridgeCore
         field("use_speaker_library", "false"); field("detect_speaker_roles", "false")
         field("webhook", "false"); field("use_multi_channel", "false")
         if let sourceLanguage { field("language_code", sourceLanguage) }
-        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.\(ext)\"\r\nContent-Type: \(mime)\r\n\r\n".utf8))
-        do {
-            let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-            guard values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size > 0 else {
-                throw SpeechToolsError.invalidRecording
-            }
-            guard size <= SpeechToolsLimits.recordingBytes else { throw SpeechToolsError.recordingTooLarge }
-            body.reserveCapacity(body.count + size + 128)
-            let handle = try FileHandle(forReadingFrom: fileURL); defer { try? handle.close() }
-            var total = 0
-            while let bytes = try handle.read(upToCount: 65_536), !bytes.isEmpty {
-                try token.check(); total += bytes.count
-                guard total <= SpeechToolsLimits.recordingBytes else { throw SpeechToolsError.recordingTooLarge }
-                body.append(bytes)
-            }
-            guard total > 0 else { throw SpeechToolsError.invalidRecording }
-        } catch let safe as SpeechToolsError { throw safe }
-        catch is CancellationError { throw CancellationError() }
-        catch { throw SpeechToolsError.invalidRecording }
+        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.\(audio.fileExtension)\"\r\nContent-Type: \(mime)\r\n\r\n".utf8))
+        body.append(audio.bytes)
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         var request = URLRequest(url: URL(string: "https://api.elevenlabs.io/v1/speech-to-text")!)
         request.httpMethod = "POST"; request.httpBody = body; request.timeoutInterval = 90
@@ -267,4 +319,34 @@ private final class SpeechToolsBuffer: @unchecked Sendable {
         bytes.append(data)
     }
     func data() -> Data { lock.lock(); defer { lock.unlock() }; return bytes }
+}
+
+/// Reads a local recording as mono 24 kHz PCM16 for mixing under a dub. Nothing is uploaded.
+enum RecordingAudioDecoder {
+    static func pcm24k(_ source: RecordingSource, maximumSeconds: Double) throws -> Data {
+        let url: URL
+        switch source {
+        case .memory(let wav):
+            // In-app recordings are already canonical 24 kHz mono PCM16.
+            return try SpeechToolsWAV.decode(wav, maximumBytes: Int(maximumSeconds) * 48_000)
+        case .file(let fileURL): url = fileURL
+        }
+        let file: AVAudioFile
+        do { file = try AVAudioFile(forReading: url) } catch { throw SpeechToolsError.invalidRecording }
+        let input = file.processingFormat
+        guard Double(file.length) / input.sampleRate <= maximumSeconds + 1 else { throw SpeechToolsError.dubTooLong }
+        guard let output = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: input, to: output),
+              let source = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(file.length)),
+              let target = AVAudioPCMBuffer(pcmFormat: output, frameCapacity: AVAudioFrameCount(Double(file.length) * 24_000 / input.sampleRate) + 4_800)
+        else { throw SpeechToolsError.invalidRecording }
+        do { try file.read(into: source) } catch { throw SpeechToolsError.invalidRecording }
+        var supplied = false, failure: NSError?
+        let status = converter.convert(to: target, error: &failure) { _, state in
+            if supplied { state.pointee = .endOfStream; return nil }
+            supplied = true; state.pointee = .haveData; return source
+        }
+        guard status != .error, let channel = target.floatChannelData?[0] else { throw SpeechToolsError.invalidRecording }
+        return PCM16.encode(Array(UnsafeBufferPointer(start: channel, count: Int(target.frameLength))))
+    }
 }

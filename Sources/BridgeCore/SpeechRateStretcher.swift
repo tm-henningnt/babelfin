@@ -75,3 +75,13 @@ public final class SpeechRateStretcher: @unchecked Sendable {
         return best
     }
 }
+
+/// The speaking rate for a direct route whose translated speech arrives faster than it plays,
+/// so the delay stays steady instead of growing with every long passage.
+public enum CatchUpRate {
+    public static func forBacklog(seconds: Double) -> Double {
+        if seconds > 6 { return 1.3 }
+        if seconds > 3 { return 1.15 }
+        return 1
+    }
+}

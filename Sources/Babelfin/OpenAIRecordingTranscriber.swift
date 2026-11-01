@@ -11,7 +11,7 @@ import BridgeCore
 
     init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport()) { self.transport = transport }
 
-    func transcribe(fileURL: URL, sourceLanguage: String?, diarize: Bool,
+    func transcribe(source: RecordingSource, sourceLanguage: String?, diarize: Bool,
                     credentials: ProviderCredentials) async throws -> RecordingTranscript {
         guard operation == nil else { throw ProviderNetworkError.busy }
         // gpt-transcribe has no documented diarized_json or speaker-label contract.
@@ -28,7 +28,7 @@ import BridgeCore
         do {
             return try await withTaskCancellationHandler {
                 var request = try await Task.detached {
-                    try Self.uploadRequest(fileURL: fileURL, sourceLanguage: sourceLanguage, token: token)
+                    try Self.uploadRequest(source: source, sourceLanguage: sourceLanguage, token: token)
                 }.value
                 try token.check(); try Task.checkCancellation()
                 request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -64,15 +64,15 @@ import BridgeCore
         operation.cancel(); transport.cancel()
     }
 
-    nonisolated private static func uploadRequest(fileURL: URL, sourceLanguage: String?,
+    nonisolated private static func uploadRequest(source: RecordingSource, sourceLanguage: String?,
                                                   token: ProviderCancellation) throws -> URLRequest {
         try token.check()
-        guard fileURL.isFileURL else { throw SpeechToolsError.invalidRecording }
-        let ext = fileURL.pathExtension.lowercased()
         let types = ["wav": "audio/wav", "mp3": "audio/mpeg", "m4a": "audio/mp4", "mp4": "video/mp4",
                      "mpeg": "audio/mpeg", "mpga": "audio/mpeg", "webm": "audio/webm",
                      "flac": "audio/flac", "ogg": "audio/ogg"]
-        guard let mime = types[ext] else { throw SpeechToolsError.unsupportedFormat }
+        if case .file(let url) = source, url.isFileURL, types[url.pathExtension.lowercased()] == nil { throw SpeechToolsError.unsupportedFormat }
+        let audio = try source.upload(check: token.check)
+        guard let mime = types[audio.fileExtension] else { throw SpeechToolsError.unsupportedFormat }
         let boundary = "Babelfin-" + UUID().uuidString
         var body = Data()
         func field(_ name: String, _ value: String) {
@@ -81,25 +81,8 @@ import BridgeCore
         field("model", "gpt-transcribe")
         if let sourceLanguage { field("languages[]", sourceLanguage) }
         // Omit response_format for the documented default JSON text/languages response.
-        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.\(ext)\"\r\nContent-Type: \(mime)\r\n\r\n".utf8))
-        do {
-            let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-            guard values.isRegularFile == true, values.isSymbolicLink != true,
-                  let size = values.fileSize, size > 0 else { throw SpeechToolsError.invalidRecording }
-            guard size <= SpeechToolsLimits.recordingBytes else { throw SpeechToolsError.recordingTooLarge }
-            body.reserveCapacity(body.count + size + 128)
-            let handle = try FileHandle(forReadingFrom: fileURL)
-            defer { try? handle.close() }
-            var total = 0
-            while let bytes = try handle.read(upToCount: 65_536), !bytes.isEmpty {
-                try token.check()
-                guard bytes.count <= SpeechToolsLimits.recordingBytes - total else { throw SpeechToolsError.recordingTooLarge }
-                total += bytes.count; body.append(bytes)
-            }
-            guard total > 0 else { throw SpeechToolsError.invalidRecording }
-        } catch let safe as SpeechToolsError { throw safe }
-        catch is CancellationError { throw CancellationError() }
-        catch { throw SpeechToolsError.invalidRecording }
+        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.\(audio.fileExtension)\"\r\nContent-Type: \(mime)\r\n\r\n".utf8))
+        body.append(audio.bytes)
         try token.check()
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/audio/transcriptions")!)

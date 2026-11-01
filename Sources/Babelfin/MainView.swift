@@ -29,7 +29,7 @@ struct MainView: View {
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(incoming ? "Meeting audio" : "Your voice").font(.title2.weight(.semibold))
+                Text(incoming ? "Listen" : "Speak").font(.title2.weight(.semibold))
                 Text(purpose).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
@@ -57,7 +57,7 @@ struct MainView: View {
             HStack(spacing: 8) {
                 Text("Input").font(.caption).foregroundStyle(.secondary).accessibilityHidden(true)
                 ProgressView(value: Double(model.level), total: 1)
-                    .tint(.accentColor).accessibilityLabel(incoming ? "Meeting audio level" : "Microphone input level")
+                    .tint(.accentColor).accessibilityLabel(incoming ? "Listen input level" : "Microphone input level")
                     .accessibilityValue("\(Int(model.level * 100)) percent")
             }
             HStack(spacing: 10) {
@@ -69,8 +69,9 @@ struct MainView: View {
                     Button("Refresh devices") { model.refresh() }.disabled(model.locked)
                 } label: { Image(systemName: "ellipsis.circle") }
                 .menuStyle(.borderlessButton).fixedSize()
-                .accessibilityLabel("\(incoming ? "Meeting audio" : "Your voice") options")
+                .accessibilityLabel("\(incoming ? "Listen" : "Speak") options")
             }
+            if !model.pendingRestart.isEmpty { RestartNotice(model: model) }
             HStack(spacing: 10) {
                 Text("Hear").foregroundStyle(.secondary)
                 HearingPicker(model: model, incoming: incoming)
@@ -125,22 +126,22 @@ struct MainView: View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
             if !incoming {
                 GridRow {
-                    label("Use for")
+                    label("Use for", pending: .devices)
                     Picker("Use for", selection: $model.destination) {
                         Text("Virtual microphone").tag(AudioDestination.teams)
-                        Text("Listen locally").tag(AudioDestination.listen)
+                        Text("My headphones").tag(AudioDestination.listen)
                     }.pickerStyle(.segmented).labelsHidden().accessibilityLabel("Destination").fixedSize()
                         .disabled(model.configurationLocked)
                     Color.clear.frame(width: 1, height: 1)
                 }
             }
             GridRow {
-                label("Service")
+                label("Service", pending: .service)
                 Text(model.route.displayName)
                 OpenSettingsButton(destination: incoming ? .incoming : .outgoing, title: "Change…").labelStyle(.titleOnly).controlSize(.small)
             }
             GridRow {
-                label("Voice")
+                label("Voice", pending: .voice)
                 Text(model.voiceDisplayName)
                 OpenSettingsButton(destination: incoming ? .incoming : .outgoing, title: "Change…").labelStyle(.titleOnly).controlSize(.small)
             }
@@ -151,7 +152,7 @@ struct MainView: View {
             }
             Divider().gridCellColumns(3)
             GridRow {
-                label(incoming ? "Meeting audio" : (model.destination == .teams ? "Microphone" : "Audio source"))
+                label(incoming ? "Audio source" : (model.destination == .teams ? "Microphone" : "Audio source"), pending: .devices)
                 Picker("Audio source", selection: $model.inputUID) {
                     Text("Choose a source").tag("")
                     if !model.inputUID.isEmpty && !model.inputAvailable { Text("\(model.selectedInputName) — disconnected").tag(model.inputUID) }
@@ -159,9 +160,9 @@ struct MainView: View {
                 }.labelsHidden().gridCellColumns(2)
             }
             GridRow {
-                label("Input language")
+                label("Input language", pending: .inputLanguage)
                 Group {
-                    if model.route == .openAI { Text("Automatic") }
+                    if !model.route.descriptor.acceptsLanguageHint { Text("Automatic") }
                     else {
                         Picker("Input language", selection: $model.sourceLanguage) {
                             Text("Automatic").tag("")
@@ -170,9 +171,9 @@ struct MainView: View {
                     }
                 }.gridCellColumns(2)
             }
-            if model.route != .openAI {
+            if !model.route.descriptor.isDirect {
                 GridRow {
-                    label("Delay")
+                    label("Delay", pending: .delay)
                     Picker("Delay", selection: $model.pacing) {
                         ForEach(TranslationPacing.allCases, id: \.self) { Text($0.displayName).tag($0) }
                     }.labelsHidden().gridCellColumns(2)
@@ -180,14 +181,14 @@ struct MainView: View {
                 }
             }
             GridRow {
-                label("Translate to")
+                label("Translate to", pending: .outputLanguage)
                 Picker("Translate to", selection: $model.targetLanguage) {
                     if !model.capabilities.outputLanguages.contains(where: { $0.code == model.targetLanguage }) { Text("Choose a language").tag(model.targetLanguage) }
                     ForEach(model.capabilities.outputLanguages) { Text($0.name).tag($0.code) }
                 }.labelsHidden().gridCellColumns(2)
             }
             GridRow {
-                label(model.destination == .teams ? "Send through" : "Listen through")
+                label(model.destination == .teams ? "Send through" : "Listen through", pending: .devices)
                 Picker("Audio output", selection: $model.outputUID) {
                     Text(model.destination == .teams ? "Choose BlackHole" : "Choose headphones or speakers").tag("")
                     if !model.outputUID.isEmpty && !model.outputAvailable { Text("\(model.selectedOutputName) — disconnected").tag(model.outputUID) }
@@ -202,8 +203,15 @@ struct MainView: View {
         }
         .disabled(model.configurationLocked)
     }
-    private func label(_ text: String) -> some View {
-        Text(text).foregroundStyle(.secondary).frame(width: 130, alignment: .leading)
+    private func label(_ text: String, pending: AppModel.PendingSetting? = nil) -> some View {
+        HStack(spacing: 4) {
+            Text(text).foregroundStyle(.secondary)
+            if let pending, model.pendingRestart.contains(pending) {
+                Image(systemName: "arrow.clockwise.circle.fill").foregroundStyle(.orange)
+                    .help("Changed during translation. Choose Restart to apply it.")
+                    .accessibilityLabel("Applies after Restart")
+            }
+        }.frame(width: 130, alignment: .leading)
     }
     private var callControls: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -218,7 +226,7 @@ struct MainView: View {
     }
     private var routeHelp: String {
         if incoming { return "Choose this loopback as the Teams speaker. Use a different loopback for Teams’ microphone, and listen through headphones." }
-        if model.destination == .teams { return "Choose this output as the Teams microphone. Meeting audio needs a separate loopback." }
+        if model.destination == .teams { return "Choose this output as the Teams microphone. Listen needs a separate loopback." }
         if model.inputs.first(where: { $0.uid == model.inputUID })?.isBlackHole == true {
             return "Send Mac audio to BlackHole in Sound settings, then play your video. All audio sent there is captured. Restore your usual output afterward."
         }

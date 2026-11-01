@@ -276,6 +276,96 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
                 let values = try PCM16.decode(result)
                 try expect(values.dropFirst(500).allSatisfy { abs($0 - 0.25) < 0.01 }, "Unexpected downmix or PCM corruption")
             }),
+            ("Provider registry derives the current routes' languages and accounts unchanged", {
+                let openAI = ProviderRegistry.route(.openAI), eleven = ProviderRegistry.route(.elevenLabs), fish = ProviderRegistry.route(.fish)
+                try expect(openAI.outputLanguages.map(\.code) == SupportedTargetLanguage.allCases.map(\.rawValue) && openAI.inputLanguages.isEmpty,
+                           "OpenAI languages changed")
+                try expect(eleven.outputLanguages == TranslationLanguage.elevenLabsOutputs && eleven.inputLanguages == TranslationLanguage.elevenLabsOutputs,
+                           "ElevenLabs route languages changed")
+                try expect(fish.outputLanguages == TranslationLanguage.composedOutputs && fish.inputLanguages == TranslationLanguage.elevenLabsOutputs,
+                           "Fish route languages changed")
+                try expect(TranslationRoute.openAI.requiredServices == [.openAI] && TranslationRoute.elevenLabs.requiredServices == [.openAI, .elevenLabs]
+                           && TranslationRoute.fish.requiredServices == [.openAI, .elevenLabs, .fish], "Required accounts changed")
+                try expect(fish.nativeSpeakingRate && !eleven.nativeSpeakingRate && eleven.acceptsLanguageHint && !openAI.acceptsLanguageHint,
+                           "Stage properties changed")
+                for route in TranslationRoute.allCases {
+                    let capabilities = ProviderCapabilities.forRoute(route), registered = ProviderRegistry.route(route)
+                    try expect(capabilities.outputLanguages == registered.outputLanguages && capabilities.inputLanguages == registered.inputLanguages,
+                               "Capabilities and registry disagree for \(route)")
+                }
+                do { _ = try RouteDescriptor(id: "x", displayName: "x", stages: [ProviderRegistry.openAIText]); throw CheckFailure(message: "Invalid chain accepted") }
+                catch is CheckFailure { throw CheckFailure(message: "Invalid chain accepted") } catch {}
+            }),
+            ("Route advisor fixes the user's language, detects the meeting's, and ranks available routes first", {
+                // Norwegian speaker in an English meeting.
+                let voice = RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "no", meetingLanguage: "en", savedServices: [.openAI])
+                try expect(voice.map(\.route.id) == ["openai", "palabra", "elevenlabs", "fish", "gemini"], "An available route must come first: \(voice.map(\.route.id))")
+                let eleven = voice.first { $0.route.id == "elevenlabs" }
+                try expect(voice[0].sourceLanguage == nil && eleven?.sourceLanguage == "no" && eleven?.missingServices == [.elevenLabs]
+                           && voice.first { $0.route.id == "gemini" }?.sourceLanguage == nil,
+                           "Detection-only routes get no lock; locking routes list missing accounts")
+                let ready = RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "no", meetingLanguage: "en", savedServices: [.openAI, .elevenLabs])
+                try expect(ready.first?.route.id == "elevenlabs" && ready.first?.sourceLanguage == "no",
+                           "With the accounts available, a route that locks the user's language must come first")
+                let meeting = RouteAdvisor.suggestions(direction: .meetingAudio, userLanguage: "en", meetingLanguage: nil, savedServices: [.openAI])
+                try expect(meeting.first?.route.id == "openai" && meeting.first?.missingServices.isEmpty == true && meeting.allSatisfy { $0.sourceLanguage == nil },
+                           "Meeting audio must detect the input and prefer a route the user can already use")
+                let norwegianOut = RouteAdvisor.suggestions(direction: .meetingAudio, userLanguage: "no", meetingLanguage: nil, savedServices: [.openAI, .elevenLabs])
+                try expect(!norwegianOut.contains { $0.route.id == "openai" } && norwegianOut.first?.route.id == "elevenlabs",
+                           "Routes that cannot speak the target must not be offered")
+                try expect(RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "en", meetingLanguage: "en", savedServices: []).isEmpty,
+                           "Same input and output language needs no translation")
+            }),
+            ("Key check classifies provider answers without trusting pre-auth validation", {
+                func body(_ text: String) -> Data { Data(text.utf8) }
+                let el = #"{"detail":{"type":"authentication_error","code":"unauthorized","message":"The API key you used is missing the permission user_read to execute this operation.","status":"missing_permissions"}}"#
+                try expect(KeyProbeClassifier.classify(service: .elevenLabs, status: 401, body: body(el)) == .missing(scope: "user_read"), "ElevenLabs scope")
+                try expect(KeyProbeClassifier.classify(service: .elevenLabs, status: 401, body: body(#"{"detail":{"status":"invalid_api_key"}}"#)) == .invalidKey, "ElevenLabs rejected key")
+                try expect(KeyProbeClassifier.classify(service: .elevenLabs, status: 404, body: body(#"{"detail":{"status":"voice_not_found"}}"#)) == .granted, "Absent voice proves access")
+                // ElevenLabs validates the body before the key, so 422 proves nothing.
+                if case .unknown = KeyProbeClassifier.classify(service: .elevenLabs, status: 422, body: body(#"{"detail":[]}"#)) {} else { throw CheckFailure(message: "422 must be unknown") }
+                let oa = #"{"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.responses.write. Check that you have the correct role.","type":"invalid_request_error"}}"#
+                try expect(KeyProbeClassifier.classify(service: .openAI, status: 401, body: body(oa)) == .missing(scope: "api.responses.write"), "OpenAI scope")
+                try expect(KeyProbeClassifier.classify(service: .openAI, status: 401, body: body(#"{"error":{"code":"invalid_api_key","message":"Incorrect API key"}}"#)) == .invalidKey, "OpenAI rejected key")
+                try expect(KeyProbeClassifier.classify(service: .openAI, status: 400, body: body(#"{"error":{"code":"missing_required_parameter"}}"#)) == .granted, "Validation after auth proves access")
+                try expect(KeyProbeClassifier.classify(service: .fish, status: 401, body: body("No permission")) == .invalidKey, "Fish rejected key")
+                let hostile = #"{"error":{"message":"Missing scopes: <script>alert(1)</script>"}}"#
+                try expect(KeyProbeClassifier.classify(service: .openAI, status: 401, body: body(hostile)) == .missing(scope: nil), "Unsafe scope text must not pass through")
+                if case .unknown = KeyProbeClassifier.classify(service: .openAI, status: 503, body: Data()) {} else { throw CheckFailure(message: "5xx must be unknown") }
+                try expect(KeyPermissions.all.allSatisfy { $0.probe.url.scheme == "https" }, "Probes use HTTPS only")
+                try expect(Set(KeyPermissions.all.map(\.id)).count == KeyPermissions.all.count, "Permission IDs are unique")
+            }),
+            ("Route advisor ranks routes with a missing key permission after ready routes", {
+                let plain = RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "no", meetingLanguage: "en", savedServices: [.openAI, .elevenLabs])
+                try expect(plain.first?.route.id == "elevenlabs", "Baseline: ElevenLabs first")
+                let lacking = RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "no", meetingLanguage: "en", savedServices: [.openAI, .elevenLabs],
+                                                      missingPermissions: ["elevenlabs.text-to-speech"])
+                try expect(lacking.first?.route.id == "openai", "A ready route must rank above one whose key lacks a permission: \(lacking.map(\.route.id))")
+                let el = lacking.first { $0.route.id == "elevenlabs" }
+                try expect(el?.missingPermissions.map(\.id) == ["elevenlabs.text-to-speech"] && el?.ready == false, "The suggestion names the missing permission")
+                let fish = lacking.first { $0.route.id == "fish" }
+                try expect(fish?.missingPermissions.isEmpty == true, "Fish speech does not need ElevenLabs Text to Speech")
+                let voiceOnly = RouteAdvisor.suggestions(direction: .yourVoice, userLanguage: "no", meetingLanguage: "en", savedServices: [.openAI, .elevenLabs],
+                                                        missingPermissions: ["elevenlabs.voices-write"])
+                try expect(voiceOnly.allSatisfy { $0.missingPermissions.isEmpty }, "Voice creation is not needed by any route")
+            }),
+            ("Usage goes to the service of each stage, never to a translation server", {
+                var ledger = UsageLedger(since: Date(timeIntervalSince1970: 0))
+                ledger.addAudio(route: TranslationRoute.fish.descriptor, secondsSent: 60, secondsReceived: 30)
+                ledger.addText(route: TranslationRoute.fish.descriptor, recognized: 100, translated: 120, spoken: true)
+                try expect(ledger.services[.elevenLabs]?.audioSecondsSent == 60 && ledger.services[.fish]?.audioSecondsReceived == 30,
+                           "Composed audio: sent to the recognizer, received from the voice")
+                try expect(ledger.services[.openAI]?.charactersTranslated == 100 && ledger.services[.fish]?.charactersSpoken == 120,
+                           "Composed text: recognized text to the translator, translated text to the voice")
+                ledger.addAudio(route: TranslationRoute.openAI.descriptor, secondsSent: 10, secondsReceived: 8)
+                ledger.addText(route: TranslationRoute.elevenLabs.descriptor, recognized: 5, translated: 7, spoken: false)
+                try expect(ledger.services[.openAI]?.audioSecondsSent == 10 && ledger.services[.openAI]?.audioSecondsReceived == 8
+                           && ledger.services[.elevenLabs]?.charactersSpoken == 0, "Direct audio and text-only speech")
+                let decoded = try JSONDecoder().decode(UsageLedger.self, from: JSONEncoder().encode(ledger))
+                try expect(decoded == ledger, "The ledger survives storage")
+                ledger.reset(at: Date(timeIntervalSince1970: 5))
+                try expect(ledger.services.isEmpty && ledger.since == Date(timeIntervalSince1970: 5), "Reset clears all counts")
+            }),
             ("Speech rate stretcher passes through at 1x, shortens and lengthens without changing pitch", {
                 let tone = PCM16.encode((0..<48_000).map { Float(0.3 * sin(2 * Double.pi * 440 * Double($0) / 24_000)) })
                 let plain = SpeechRateStretcher()
@@ -295,6 +385,8 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
                 try expect(abs(frequency - 440) < 15, "Pitch changed to \(frequency) Hz")
                 try expect(core.map { abs($0) }.max()! < 0.4, "Overlap-add exceeded the source amplitude")
                 let clamped = SpeechRateStretcher(); clamped.setRate(9); try expect(clamped.rate == SpeechRateStretcher.maximumRate, "Rate must be clamped")
+                try expect([1.0, 3.5, 7].map { CatchUpRate.forBacklog(seconds: $0) } == [1, 1.15, 1.3],
+                           "A direct route speeds up waiting translated speech in steps")
                 let slow = SpeechRateStretcher(); slow.setRate(0.95)
                 var slowed = Data()
                 for start in stride(from: 0, to: tone.count, by: 4_800) { slowed.append(try slow.process(tone.subdata(in: start..<min(tone.count, start + 4_800)))) }

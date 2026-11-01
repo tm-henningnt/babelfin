@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 import BridgeCore
@@ -21,6 +22,29 @@ enum RecordingService: String, CaseIterable, Identifiable {
     var account: ProviderService { self == .elevenLabs ? .elevenLabs : .openAI }
 }
 
+/// One generated voice clip, kept so takes with different directions can be compared.
+struct VoiceTake: Identifiable, Equatable {
+    let id = UUID()
+    let number: Int
+    let direction: SpeechDirection
+    let audio: Data
+    var title: String { "Take \(number) · \(direction.delivery.displayName) · \(direction.speed.formatted(.number.precision(.fractionLength(2))))×" }
+}
+
+/// Where Audio file takes its audio from.
+enum AudioInput: String, CaseIterable, Identifiable {
+    case file, microphone
+    var id: String { rawValue }
+    var title: String { self == .file ? "File" : "Microphone" }
+}
+
+/// What Voice clip speaks: typed text, or the microphone recording with a new voice.
+enum VoiceSource: String, CaseIterable, Identifiable {
+    case text, recording
+    var id: String { rawValue }
+    var title: String { self == .text ? "Text" : "My recording" }
+}
+
 private final class PreviewDeviceObservation: @unchecked Sendable {
     private let token: NSObjectProtocol
     init(_ token: NSObjectProtocol) { self.token = token }
@@ -37,29 +61,53 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
     @Published private(set) var missingKeys: Set<ProviderService> = []
     @Published private(set) var fileURL: URL?
     @Published private(set) var fileSize = ""
+    @Published var audioInput: AudioInput = .file { didSet { if audioInput != oldValue { resetRecording() } } }
+    /// One microphone recording for both tools: record once, then transcribe it or give it a new voice.
+    /// It stays in memory and is uploaded only when you choose an action.
+    let microphone = VoiceSampleRecorder(minimumSeconds: 2, maximumSeconds: SpeechToolsLimits.microphoneSeconds)
+    @Published var microphoneUID = ""
+    @Published private(set) var microphones: [AudioDevice] = []
+    @Published private(set) var microphoneRecording: Data? {
+        didSet {
+            guard microphoneRecording != oldValue else { return }
+            if audioInput == .microphone { resetRecording() }
+            if voiceSource == .recording { clearTakes() }
+        }
+    }
+    @Published var voiceSource: VoiceSource = .text { didSet { if voiceSource != oldValue { clearTakes(); clearNotice() } } }
+    private var microphoneObservation: AnyCancellable?
     @Published var sourceLanguage = ""
     @Published var recordingService: RecordingService = .elevenLabs
     @Published var diarize = true
     @Published var targetLanguage = "en"
-    @Published private(set) var recording: RecordingTranscript?
+    @Published private(set) var recording: RecordingTranscript? { didSet { if recording != oldValue { dub = nil } } }
+    @Published var dubIncludesOriginal = true
+    /// The latest dub WAV. It stays in memory until the recording changes or the app quits.
+    @Published private(set) var dub: Data?
     @Published private(set) var recordingContext = ""
     @Published private var completedRecordingSignature: String?
     @Published private var recordingAttemptIncomplete = false
     @Published var notesInput: String { didSet { if notesInput != oldValue { notesResult = nil; clearNotice() } } }
     @Published private(set) var notesResult: MeetingNotes?
-    @Published var voiceText = "" { didSet { if voiceText != oldValue { clip = nil; clearNotice() } } }
+    @Published var voiceText = "" { didSet { if voiceText != oldValue { clearTakes(); clearNotice() } } }
     @Published var voiceProvider: VoiceProvider = .elevenLabs {
         didSet {
             guard voiceProvider != oldValue else { return }
-            voices = []; voiceID = ""; clip = nil; voicesLoaded = false; clearNotice()
+            voices = []; voiceID = ""; clearTakes(); voicesLoaded = false; clearNotice()
             if !voiceLanguages.contains(where: { $0.code == voiceLanguage }) { voiceLanguage = "en" }
         }
     }
-    @Published var voiceLanguage = "en" { didSet { if voiceLanguage != oldValue { clip = nil; clearNotice() } } }
-    @Published var voiceID = "" { didSet { if voiceID != oldValue { clip = nil; clearNotice() } } }
+    @Published var voiceLanguage = "en" { didSet { if voiceLanguage != oldValue { clearTakes(); clearNotice() } } }
+    @Published var voiceID = "" { didSet { if voiceID != oldValue { clearTakes(); clearNotice() } } }
+    /// Delivery and speed change only the next take; earlier takes stay for comparison.
+    @Published var voiceDelivery: SpeechDirection.Delivery = .natural
+    @Published var voiceSpeed = 1.0
     @Published private(set) var voices: [ProviderVoice] = []
     @Published private(set) var voicesLoaded = false
-    @Published private(set) var clip: Data? { didSet { if clip != oldValue { stopClip() } } }
+    @Published private(set) var takes: [VoiceTake] = []
+    @Published var selectedTakeID: UUID? { didSet { if selectedTakeID != oldValue { stopClip() } } }
+    /// The selected take's WAV, which Play and Save use.
+    var clip: Data? { takes.first { $0.id == selectedTakeID }?.audio }
     @Published private(set) var playingClip = false
     @Published private(set) var previewOutputs: [AudioDevice] = []
     @Published var previewOutputUID = "" { didSet { if previewOutputUID != oldValue { stopClip() } } }
@@ -101,6 +149,11 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
         lastCredentialVersion = credentialVersion()
         if !initialNotesText.isEmpty { page = .notes }
         self.service.onProgress = { [weak self] in self?.progress = $0 }
+        // A finished recording becomes the tools' input, including one stopped at the length limit.
+        microphoneObservation = microphone.$recording.removeDuplicates().dropFirst().sink { [weak self] recording in
+            guard !recording else { return }
+            Task { @MainActor [weak self] in self?.adoptMicrophoneRecording() }
+        }
     }
 
     var voiceLanguages: [TranslationLanguage] {
@@ -128,7 +181,7 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
         let version = credentialVersion()
         if let previous = lastCredentialVersion, previous != version {
             cancel()
-            voices = []; voicesLoaded = false; voiceID = ""; clip = nil
+            voices = []; voicesLoaded = false; voiceID = ""; clearTakes()
             clearNotice()
         }
         lastCredentialVersion = version
@@ -155,6 +208,32 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         selectFile(url)
     }
+    /// The audio Audio file transcribes and dubs.
+    var audioSource: RecordingSource? {
+        switch audioInput {
+        case .file: return fileURL.map { .file($0) }
+        case .microphone: return microphoneRecording.map { .memory(wav: $0) }
+        }
+    }
+    func refreshMicrophones() {
+        microphones = previewDeviceList().filter(\.isPhysicalInput)
+        if !microphones.contains(where: { $0.uid == microphoneUID }) { microphoneUID = microphones.first?.uid ?? "" }
+    }
+    func toggleMicrophone() {
+        if microphone.recording { microphone.stop(); return }
+        guard !busy, let device = microphones.first(where: { $0.uid == microphoneUID }) else { return }
+        stopClip()
+        Task { await microphone.start(input: device) }
+    }
+    func discardMicrophoneRecording() { microphone.discard(); microphoneRecording = nil }
+    private func adoptMicrophoneRecording() {
+        guard !microphone.recording else { return }
+        microphoneRecording = microphone.sample.meetsMinimum ? try? microphone.sample.wav() : nil
+    }
+    private func resetRecording() {
+        recording = nil; recordingContext = ""; completedRecordingSignature = nil
+        recordingAttemptIncomplete = false; clearNotice()
+    }
     func selectFile(_ url: URL) {
         guard !busy else { return }
         do {
@@ -164,13 +243,12 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
             }
             guard bytes <= SpeechToolsLimits.recordingBytes else { throw SpeechToolsError.recordingTooLarge }
             fileURL = url; fileSize = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
-            recording = nil; recordingContext = ""; completedRecordingSignature = nil
-            recordingAttemptIncomplete = false; clearNotice()
+            resetRecording()
         } catch let safe as SpeechToolsError { showError(safe.localizedDescription) }
         catch { showError("The file could not be read. Choose another recording.") }
     }
     func transcribe() {
-        guard !busy, let fileURL else { return }
+        guard !busy, !microphone.recording, let audio = audioSource else { return }
         let source = sourceLanguage.isEmpty ? nil : sourceLanguage, selectedService = recordingService
         let speakers = selectedService == .elevenLabs && diarize
         let signature = recordingSignature
@@ -181,7 +259,7 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
             model.fileService = transcriber
             transcriber.onProgress = { [weak model] in model?.progress = $0 }
             defer { model.fileService = nil }
-            let result = try await transcriber.transcribe(fileURL: fileURL, sourceLanguage: source, diarize: speakers, credentials: keys)
+            let result = try await transcriber.transcribe(source: audio, sourceLanguage: source, diarize: speakers, credentials: keys)
             try model.checkCurrentOperation(); model.recording = result
             model.completedRecordingSignature = signature; model.recordingAttemptIncomplete = false
             model.recordingContext = "\(selectedService.title) · \(language)\(speakers ? " · Speaker labels" : "")"
@@ -196,6 +274,28 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
             try model.checkCurrentOperation(); model.recording = result; model.notice = "Translation finished."
         }
     }
+    /// A dub needs a translation with segment times and a ready voice from Voice clip.
+    var canDub: Bool {
+        guard !busy, let recording, recording.targetLanguage != nil, audioSource != nil else { return false }
+        let translated = recording.segments.filter { $0.translatedText != nil }
+        return !translated.isEmpty && translated.allSatisfy { $0.startSeconds != nil } && (voiceProvider == .fish || !voiceID.isEmpty)
+    }
+    var dubCharacters: Int { recording?.segments.reduce(0) { $0 + ($1.translatedText?.count ?? 0) } ?? 0 }
+    func createDub() {
+        refreshKeyPresence()
+        guard canDub, let recording, let audio = audioSource else { return }
+        let route: TranslationRoute = voiceProvider == .elevenLabs ? .elevenLabs : .fish
+        let voice = voiceID.isEmpty ? nil : voiceID, direction = SpeechDirection(delivery: voiceDelivery, speed: voiceSpeed)
+        let includeOriginal = dubIncludesOriginal
+        perform("Dubbing…", services: [voiceAccount]) { model, keys in
+            let data = try await model.service.dub(transcript: recording, source: audio, includeOriginal: includeOriginal, originalLevel: 0.25,
+                                                   voiceID: voice, route: route, direction: direction, credentials: keys)
+            try model.checkCurrentOperation()
+            guard model.recording == recording else { throw CancellationError() }
+            model.dub = data; model.notice = "The dub is ready to save."
+        }
+    }
+    func saveDub() { if let dub { save(dub, name: "Babelfin dub", extension: "wav") } }
     func useRecordingForNotes() {
         guard let recording, !busy else { return }
         notesInput = recording.plainText(); page = .notes; clearNotice()
@@ -225,16 +325,35 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
     func generateClip() {
         stopClip()
         refreshKeyPresence()
+        if voiceSource == .recording { revoiceRecording(); return }
         guard canGenerate else { return }
         let text = voiceText, language = voiceLanguage, voice = voiceID.isEmpty ? nil : voiceID
         let route: TranslationRoute = voiceProvider == .elevenLabs ? .elevenLabs : .fish
+        let direction = SpeechDirection(delivery: voiceDelivery, speed: voiceSpeed)
         perform("Generating voice clip…", services: [voiceAccount]) { model, keys in
-            let data = try await model.service.voiceClip(text: text, language: language, voiceID: voice, route: route, credentials: keys)
+            let data = try await model.service.voiceClip(text: text, language: language, voiceID: voice, route: route,
+                                                         direction: direction, credentials: keys)
             try model.checkCurrentOperation()
             guard model.voiceText == text, model.voiceLanguage == language,
                   (model.voiceID.isEmpty ? nil : model.voiceID) == voice,
                   (model.voiceProvider == .elevenLabs ? TranslationRoute.elevenLabs : .fish) == route else { throw CancellationError() }
-            model.clip = data; model.notice = "Voice clip is ready to play or save."
+            model.addTake(data, direction: direction)
+        }
+    }
+
+    /// A new voice for the microphone recording needs ElevenLabs and a chosen voice.
+    var canRevoice: Bool {
+        !busy && !microphone.recording && voiceProvider == .elevenLabs && !voiceID.isEmpty
+        && (microphoneRecording?.count ?? .max) <= SpeechToolsLimits.voicePCMBytes + 44
+    }
+    private func revoiceRecording() {
+        guard canRevoice, let wav = microphoneRecording else { return }
+        let voice = voiceID, direction = SpeechDirection(delivery: voiceDelivery)
+        perform("Giving your recording a new voice…", services: [.elevenLabs]) { model, keys in
+            let data = try await model.service.revoice(wav: wav, voiceID: voice, delivery: direction.delivery, credentials: keys)
+            try model.checkCurrentOperation()
+            guard model.microphoneRecording == wav, model.voiceID == voice, model.voiceSource == .recording else { throw CancellationError() }
+            model.addTake(data, direction: direction)
         }
     }
 
@@ -313,7 +432,21 @@ private final class PreviewDeviceObservation: @unchecked Sendable {
         } catch { showError("Could not prepare the transcript. Try saving as plain text.") }
     }
     func saveNotes() { if let notesResult { save(Data(notesResult.text.utf8), name: "Babelfin notes", extension: "txt") } }
-    func saveClip() { if let clip { save(clip, name: "Babelfin voice clip", extension: "wav") } }
+    func saveClip() {
+        guard let take = takes.first(where: { $0.id == selectedTakeID }) else { return }
+        save(take.audio, name: "Babelfin voice clip take \(take.number)", extension: "wav")
+    }
+    /// Inserts an audio tag such as [whispers] at the end of the text.
+    func appendTag(_ tag: String) {
+        voiceText += (voiceText.isEmpty || voiceText.hasSuffix(" ") ? "" : " ") + tag + " "
+    }
+    private func clearTakes() { takes = []; selectedTakeID = nil }
+    private func addTake(_ audio: Data, direction: SpeechDirection) {
+        let take = VoiceTake(number: (takes.last?.number ?? 0) + 1, direction: direction, audio: audio)
+        takes = Array((takes + [take]).suffix(SpeechToolsLimits.voiceTakes))
+        selectedTakeID = take.id
+        notice = "Take \(take.number) is ready to play or save."
+    }
 
     private func save(_ data: Data, name: String, extension ext: String) {
         let panel = NSSavePanel(); panel.nameFieldStringValue = name + "." + ext
@@ -370,10 +503,23 @@ private enum SpeechToolsUIError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .credentials(let services):
-            let names = services.map { service in
-                switch service { case .openAI: return "OpenAI"; case .elevenLabs: return "ElevenLabs"; case .fish: return "Fish Audio" }
-            }.sorted().joined(separator: " and ")
+            let names = services.map(\.displayName).sorted().joined(separator: " and ")
             return "Add your \(names) API key in Settings, or allow Keychain access, then try again."
         }
     }
 }
+
+#if BABELFIN_SCREENSHOTS
+extension SpeechToolsModel {
+    /// Private documentation build only: one fictional voice, a sentence and three silent takes.
+    func seedDemoVoiceClip() {
+        voices = [ProviderVoice(id: "demovoice", name: "Kari", provider: .elevenLabs, state: "available", isReady: true)]
+        voicesLoaded = true; voiceID = "demovoice"
+        voiceText = "Thank you for joining. Let's start with the launch date."
+        let silence = Data(repeating: 0, count: 48_000)
+        takes = [SpeechDirection(delivery: .steady), SpeechDirection(), SpeechDirection(delivery: .expressive, speed: 1.1)]
+            .enumerated().map { VoiceTake(number: $0.offset + 1, direction: $0.element, audio: silence) }
+        selectedTakeID = takes[1].id
+    }
+}
+#endif

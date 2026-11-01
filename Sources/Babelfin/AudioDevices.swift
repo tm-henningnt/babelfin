@@ -31,8 +31,8 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
 /// Devices that Babelfin selects when a direction has no saved device.
 /// A saved device, also an unavailable one, always takes precedence.
 enum DefaultAudioDevice {
-    /// Your voice output: Babelfin Microphone, else the only two-channel loopback.
-    /// Babelfin Speaker belongs to Meeting audio, so it is never a candidate here.
+    /// Speak output: Babelfin Microphone, else the only two-channel loopback.
+    /// Babelfin Speaker belongs to Listen, so it is never a candidate here.
     static func outgoingOutput(from outputs: [AudioDevice]) -> String? {
         let candidates = outputs.filter {
             $0.isBlackHole && $0.inputChannels == 2 && $0.outputChannels == 2 && $0.uid != AudioDevice.babelfinSpeakerUID
@@ -40,7 +40,7 @@ enum DefaultAudioDevice {
         if candidates.contains(where: { $0.uid == AudioDevice.babelfinMicrophoneUID }) { return AudioDevice.babelfinMicrophoneUID }
         return candidates.count == 1 ? candidates[0].uid : nil
     }
-    /// Meeting audio source: Babelfin Speaker only. Another loopback can carry Your voice.
+    /// Listen source: Babelfin Speaker only. Another loopback can carry Speak.
     static func incomingSource(from inputs: [AudioDevice]) -> String? {
         inputs.contains { $0.uid == AudioDevice.babelfinSpeakerUID && $0.inputChannels > 0 } ? AudioDevice.babelfinSpeakerUID : nil
     }

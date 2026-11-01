@@ -19,6 +19,7 @@ struct AppPreferences: Codable, Equatable {
     var providerRoute = "openai"
     var sourceLanguage = ""
     var pacing = TranslationPacing.balanced.rawValue
+    var speakTranslation = true
     var voices: [String: String] = [:]
     var readyForCalls = false
     var explicitlyMuted = false
@@ -30,7 +31,7 @@ struct AppPreferences: Codable, Equatable {
     var originalMixDucking = true
     var outputVolume = 1.0
     private enum CodingKeys: String, CodingKey {
-        case destination, teams, teamsOutputConfigured, listen, listenInputConfigured, targetLanguage, transcriptVisible, providerRoute, sourceLanguage, pacing, voices
+        case destination, teams, teamsOutputConfigured, listen, listenInputConfigured, targetLanguage, transcriptVisible, providerRoute, sourceLanguage, pacing, speakTranslation, voices
         case originalMixEnabled, originalMixLevel, originalMixDucking, outputVolume
         case explicitlyMuted, explicitlyOff, translationIntent, readyForCalls
     }
@@ -46,6 +47,7 @@ struct AppPreferences: Codable, Equatable {
         providerRoute = try values.decodeIfPresent(String.self, forKey: .providerRoute) ?? "openai"
         sourceLanguage = try values.decodeIfPresent(String.self, forKey: .sourceLanguage) ?? ""
         pacing = try values.decodeIfPresent(String.self, forKey: .pacing) ?? TranslationPacing.balanced.rawValue
+        speakTranslation = try values.decodeIfPresent(Bool.self, forKey: .speakTranslation) ?? true
         voices = try values.decodeIfPresent([String: String].self, forKey: .voices) ?? [:]
         readyForCalls = try values.decodeIfPresent(Bool.self, forKey: .readyForCalls) ?? false
         explicitlyMuted = try values.decodeIfPresent(Bool.self, forKey: .explicitlyMuted) ?? false
@@ -97,6 +99,7 @@ struct AppSessionConfiguration {
     let sourceLanguage: String?
     let voiceID: String?
     var pacing: TranslationPacing = .balanced
+    var speaksTranslation = true
     let originalAudio: Bool
     let originalMixEnabled: Bool
     let originalMixLevel: Double

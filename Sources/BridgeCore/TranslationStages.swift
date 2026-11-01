@@ -95,6 +95,11 @@ public typealias RecognitionEventHandler = @MainActor @Sendable (RecognitionEven
     /// Completes only after accepted input and the last committed transcript have been delivered.
     func finish() async throws
     func cancel()
+    /// Applies a new Delay to the passages that follow. Settings the service fixes at connect stay.
+    func updatePacing(_ pacing: TranslationPacing)
+}
+public extension StreamingSpeechRecognizer {
+    func updatePacing(_ pacing: TranslationPacing) {}
 }
 @MainActor public protocol TextTranslationStage: AnyObject, Sendable {
     func translate(text: String, sourceLanguage: String?, targetLanguage: String, credentials: ProviderCredentials) async throws -> String
@@ -108,9 +113,33 @@ public typealias RecognitionEventHandler = @MainActor @Sendable (RecognitionEven
     /// Requests a speaking rate for the next synthesis. Returns true when the service applies
     /// it natively; otherwise the caller time-stretches the returned audio.
     func prepareSpeakingRate(_ rate: Double) -> Bool
+    /// Speaks a voice clip as directed. The default ignores the direction.
+    func synthesize(text: String, language: String, voiceID: String?, direction: SpeechDirection,
+                    credentials: ProviderCredentials, onAudio: @escaping TranslationAudioHandler) async throws
 }
 public extension SpeechSynthesisStage {
     func prepareSpeakingRate(_ rate: Double) -> Bool { false }
+    func synthesize(text: String, language: String, voiceID: String?, direction: SpeechDirection,
+                    credentials: ProviderCredentials, onAudio: @escaping TranslationAudioHandler) async throws {
+        try await synthesize(text: text, language: language, voiceID: voiceID, credentials: credentials, onAudio: onAudio)
+    }
+}
+
+/// How a voice clip is spoken. Only voice clips use it; live translation keeps each service's defaults.
+public struct SpeechDirection: Equatable, Sendable {
+    public enum Delivery: String, CaseIterable, Sendable {
+        case steady, natural, expressive
+        public var displayName: String { rawValue.capitalized }
+    }
+    public static let speeds: ClosedRange<Double> = 0.7...1.2
+    public static let standard = SpeechDirection()
+    public var delivery: Delivery
+    /// Speaking rate. ElevenLabs and Fish Audio both accept 0.7 to 1.2.
+    public var speed: Double
+    public init(delivery: Delivery = .natural, speed: Double = 1) {
+        self.delivery = delivery
+        self.speed = speed.isFinite ? min(Self.speeds.upperBound, max(Self.speeds.lowerBound, speed)) : 1
+    }
 }
 
 /// Stores revision/finality metadata, not full meeting text. Once committed, a segment may

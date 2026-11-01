@@ -1,23 +1,27 @@
 import AVFoundation
 import BridgeCore
 
-/// Records a voice-creation sample from one explicitly chosen physical microphone into
-/// memory. It never selects a default device, never records a loopback, and never writes
-/// the sample to disk. Recording stops at the length limit or when the route changes.
+/// Records from one explicitly chosen physical microphone into memory: a voice-creation
+/// sample, or a recording for the speech tools. It never selects a default device, never
+/// records a loopback, and never writes the audio to disk. Recording stops at the length
+/// limit or when the route changes. Capture is bound to the device ID, as in live translation,
+/// so the system default input is never opened.
 @MainActor final class VoiceSampleRecorder: ObservableObject {
     @Published private(set) var recording = false
     @Published private(set) var playing = false
     @Published private(set) var level: Float = 0
-    @Published private(set) var sample = VoiceSampleBuffer()
+    @Published private(set) var sample: VoiceSampleBuffer
     @Published private(set) var notice = ""
-    private var engine: AVAudioEngine?
+    private var capture: DeviceInputCapture?
     private var device: AudioDevice?
     private var generation = UUID()
-    private var observer: NSObjectProtocol?
     private var routeWatch: Task<Void, Never>?
     private var playback: Task<Void, Never>?
     private let player = VoicePreviewPlayer()
 
+    init(minimumSeconds: Int = VoiceSampleBuffer.minimumSeconds, maximumSeconds: Int = VoiceSampleBuffer.maximumSeconds) {
+        sample = VoiceSampleBuffer(minimumSeconds: minimumSeconds, maximumSeconds: maximumSeconds)
+    }
     var seconds: Double { sample.seconds }
     var hasSample: Bool { !sample.pcm.isEmpty }
 
@@ -25,43 +29,35 @@ import BridgeCore
         stopPlayback()
         guard !recording else { return }
         notice = ""
-        guard input.isPhysicalInput else { notice = "Choose a physical microphone. BlackHole and other virtual devices cannot record a voice sample."; return }
+        guard input.isPhysicalInput else { notice = "Choose a physical microphone. BlackHole and other virtual devices cannot record."; return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: break
         case .notDetermined:
-            guard await AVCaptureDevice.requestAccess(for: .audio) else { notice = "Allow microphone access in System Settings to record a sample."; return }
-        default: notice = "Allow microphone access in System Settings › Privacy & Security › Microphone to record a sample."; return
+            guard await AVCaptureDevice.requestAccess(for: .audio) else { notice = "Allow microphone access in System Settings to record."; return }
+        default: notice = "Allow microphone access in System Settings › Privacy & Security › Microphone to record."; return
         }
         sample.discard()
-        let engine = AVAudioEngine()
         do {
-            try AudioDevices.select(input.id, on: engine.inputNode.audioUnit)
-            let format = engine.inputNode.outputFormat(forBus: 0)
-            guard format.sampleRate > 0, format.channelCount > 0,
-                  let target = AVAudioFormat(standardFormatWithSampleRate: Double(VoiceSampleBuffer.sampleRate), channels: 1) else {
+            let capture = try DeviceInputCapture(device: input.id)
+            guard let target = AVAudioFormat(standardFormatWithSampleRate: Double(VoiceSampleBuffer.sampleRate), channels: 1) else {
                 throw BridgeError.unavailable("The microphone format is unavailable.")
             }
-            let sink = RecorderSink(conversion: try CaptureConversion(sourceFormat: format, target: target, loopback: false, packetFrames: 2400))
+            let sink = RecorderSink(format: capture.format,
+                                    conversion: try CaptureConversion(sourceFormat: capture.format, target: target, loopback: false, packetFrames: 2400))
             let token = UUID(); generation = token
-            engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
-                guard let (chunks, level) = sink.convert(buffer) else { return }
+            sink.onConverted = { [weak self] chunks, level in
                 Task { @MainActor [weak self] in self?.receive(chunks, level: level, token: token) }
             }
-            engine.prepare()
-            try engine.start()
-            self.engine = engine; device = input; recording = true
-            observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { if self?.generation == token { self?.fail("The microphone changed. Record the sample again.") } }
-            }
+            try capture.start { frames, buffers in sink.copy(frames: frames, buffers: buffers) }
+            self.capture = capture; device = input; recording = true
             routeWatch = Task { [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 250_000_000)
                     guard let self, self.generation == token else { return }
-                    if !self.routeIntact() { self.fail("The microphone disconnected. Record the sample again."); return }
+                    if !self.routeIntact() { self.fail("The microphone disconnected or changed. Record again."); return }
                 }
             }
         } catch {
-            engine.stop()
             notice = (error as? BridgeError)?.localizedDescription ?? "The microphone could not start recording."
         }
     }
@@ -69,11 +65,10 @@ import BridgeCore
     func stop() {
         generation = UUID()
         routeWatch?.cancel(); routeWatch = nil
-        if let observer { NotificationCenter.default.removeObserver(observer) }; observer = nil
-        engine?.inputNode.removeTap(onBus: 0); engine?.stop(); engine = nil; device = nil
+        capture?.stop(); capture = nil; device = nil
         recording = false; level = 0
         if hasSample && !sample.meetsMinimum {
-            notice = "Record at least \(VoiceSampleBuffer.minimumSeconds) seconds of speech."
+            notice = "Record at least \(sample.minimum) seconds of speech."
         }
     }
     func discard() { stop(); stopPlayback(); sample.discard(); notice = "" }
@@ -106,22 +101,38 @@ import BridgeCore
         self.level = level
         for chunk in chunks {
             guard (try? sample.append(chunk)) == true else {
-                stop(); notice = "Recording stopped at the \(VoiceSampleBuffer.maximumSeconds)-second limit."; return
+                stop(); notice = "Recording stopped at the \(sample.maximum)-second limit."; return
             }
         }
-        if sample.isFull { stop(); notice = "Recording stopped at the \(VoiceSampleBuffer.maximumSeconds)-second limit." }
+        if sample.isFull { stop(); notice = "Recording stopped at the \(sample.maximum)-second limit." }
     }
     private func fail(_ message: String) { stop(); sample.discard(); notice = message }
     private func routeIntact() -> Bool {
-        guard let engine, let device, engine.isRunning,
-              AudioDevices.selected(on: engine.inputNode.audioUnit) == device.id else { return false }
+        guard let capture, let device, capture.isRunning, capture.currentFormatMatches() else { return false }
         return AudioDevices.cached().contains { $0.id == device.id && $0.uid == device.uid && $0.isPhysicalInput }
     }
 }
 
-/// Owned by the tap thread; the tap delivers buffers serially.
+/// `copy` runs on the device's IO thread and only copies the samples. Conversion runs on a
+/// serial queue, so `conversion` and `onConverted` are used from one thread at a time.
 private final class RecorderSink: @unchecked Sendable {
+    private let format: AVAudioFormat
     private let conversion: CaptureConversion
-    init(conversion: CaptureConversion) { self.conversion = conversion }
-    func convert(_ buffer: AVAudioPCMBuffer) -> ([Data], Float)? { try? conversion.convert(buffer) }
+    private let queue = DispatchQueue(label: "no.tallmaker.Babelfin.recorder")
+    var onConverted: (([Data], Float) -> Void)?
+    init(format: AVAudioFormat, conversion: CaptureConversion) { self.format = format; self.conversion = conversion }
+    func copy(frames: AVAudioFrameCount, buffers: UnsafePointer<AudioBufferList>) {
+        guard frames > 0, let bytes = buffers.pointee.mBuffers.mData else { return }
+        let samples = Data(bytes: bytes, count: Int(buffers.pointee.mBuffers.mDataByteSize))
+        queue.async { self.convert(samples, frames: frames) }
+    }
+    private func convert(_ samples: Data, frames: AVAudioFrameCount) {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
+              let destination = buffer.mutableAudioBufferList.pointee.mBuffers.mData else { return }
+        let capacity = Int(buffer.mutableAudioBufferList.pointee.mBuffers.mDataByteSize)
+        samples.withUnsafeBytes { _ = memcpy(destination, $0.baseAddress!, min(capacity, $0.count)) }
+        buffer.frameLength = frames
+        guard let (chunks, level) = try? conversion.convert(buffer) else { return }
+        onConverted?(chunks, level)
+    }
 }

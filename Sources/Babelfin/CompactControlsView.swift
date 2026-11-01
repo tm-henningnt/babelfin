@@ -15,19 +15,48 @@ struct TranslationControls: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(actions.primaryDisabled)
                 .help(actions.primaryHelp)
-                .accessibilityLabel("\(incoming ? "Meeting audio" : "Your voice"): \(actions.primaryTitle)")
+                .accessibilityLabel("\(incoming ? "Listen" : "Speak"): \(actions.primaryTitle)")
             if spaced { Spacer(minLength: 8) }
             Button { Task { await actions.toggleMute() } } label: {
                 Label(model.muted ? "Unmute" : "Mute", systemImage: incoming ? (model.muted ? "speaker.wave.2" : "speaker.slash") : (model.muted ? "mic" : "mic.slash"))
             }
             .labelStyle(.iconOnly)
             .disabled(actions.muteDisabled)
-            .accessibilityLabel("\(model.muted ? "Unmute" : "Mute") \(incoming ? "meeting audio" : "your microphone")")
+            .accessibilityLabel("\(model.muted ? "Unmute" : "Mute") \(incoming ? "Listen" : "Speak")")
             .help(model.muted ? "Unmute this direction" : "Silence this direction")
             Button("Off") { Task { await actions.turnOff() } }
                 .disabled(actions.offDisabled)
-                .accessibilityLabel("Turn \(incoming ? "meeting audio" : "your microphone") off")
+                .accessibilityLabel("Turn \(incoming ? "Listen" : "Speak") off")
                 .help("Stop all audio in this direction and turn off call readiness")
+        }
+    }
+}
+
+/// Settings changed during translation that wait for Restart, with the Restart button. The first
+/// time it appears, an alert explains it; the user can turn the alert off.
+@MainActor private final class RestartNoticeState: ObservableObject { @Published var explaining = false }
+struct RestartNotice: View {
+    @ObservedObject var model: AppModel
+    var compact = false
+    @AppStorage("babelfin.restartExplained") private var explained = false
+    @StateObject private var state = RestartNoticeState()
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.clockwise.circle.fill").foregroundStyle(.orange).accessibilityHidden(true)
+            Text(compact ? "Restart to apply changes" : "Restart to apply: " + AppModel.PendingSetting.allCases.filter { model.pendingRestart.contains($0) }.map(\.title).joined(separator: ", "))
+                .font(compact ? .caption : .callout).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button("Restart") { Task { await model.restartTranslation() } }
+                .controlSize(compact ? .small : .regular)
+                .help("Reconnect with the new settings. Original audio continues while it connects, unless audio devices changed.")
+        }
+        .onAppear { if !explained { state.explaining = true } }
+        .alert("Some changes need a restart", isPresented: $state.explaining) {
+            Button("Restart Now") { Task { await model.restartTranslation() } }
+            Button("Later", role: .cancel) {}
+            Button("Don’t Show Again") { explained = true }
+        } message: {
+            Text("A new voice or output language applies at once on ElevenLabs and Fish Audio. The service, input language, Delay, Speak the translation and audio devices apply when you choose Restart. Original audio continues while Babelfin reconnects, unless audio devices changed.")
         }
     }
 }
@@ -42,7 +71,7 @@ struct HearingPicker: View {
             ForEach(AppModel.Hearing.allCases) { Text($0.title).tag($0) }
         }
         .pickerStyle(.segmented).labelsHidden().fixedSize()
-        .accessibilityLabel("\(incoming ? "Meeting audio" : "Your voice"): hear")
+        .accessibilityLabel("\(incoming ? "Listen" : "Speak"): hear")
         .help("Choose what you hear while translating. With Original, translation keeps running and the original plays at full volume.")
     }
 }
@@ -65,7 +94,7 @@ struct OutputVolumeControl: View {
         HStack(spacing: 6) {
             Image(systemName: icon).foregroundStyle(.secondary).frame(width: 18).accessibilityHidden(true)
             Slider(value: $model.outputVolume, in: 0...1).frame(width: compact ? 90 : 140).controlSize(compact ? .small : .regular)
-                .accessibilityLabel("\(incoming ? "Meeting audio" : "Your voice") output volume")
+                .accessibilityLabel("\(incoming ? "Listen" : "Speak") output volume")
                 .accessibilityValue("\(Int((model.outputVolume * 100).rounded())) percent")
             if !compact {
                 Text("\(Int((model.outputVolume * 100).rounded()))%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
@@ -168,7 +197,7 @@ private struct CompactDirectionView: View {
             HStack(spacing: 10) {
                 Circle().fill(model.statusColor).frame(width: 8, height: 8).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(incoming ? "Meeting audio" : "Your voice").font(.headline)
+                    Text(incoming ? "Listen" : "Speak").font(.headline)
                     Text("\(model.languageSummary) · \(model.sessionTitle)").font(.caption).foregroundStyle(.secondary)
                         .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 }
@@ -193,19 +222,20 @@ private struct CompactDirectionView: View {
                     Button("Audio setup…", action: configure)
                 } label: { Image(systemName: "ellipsis.circle") }
                 .menuStyle(.borderlessButton).fixedSize()
-                .accessibilityLabel("\(incoming ? "Meeting audio" : "Your voice") options")
+                .accessibilityLabel("\(incoming ? "Listen" : "Speak") options")
             }
             if model.phase == .failed || model.requiresDeviceResume || model.translationIssue != nil {
                 Text(model.sessionNotice).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 10) {
                 ProgressView(value: Double(model.level), total: 1).controlSize(.small)
-                    .accessibilityLabel(incoming ? "Meeting audio level" : "Microphone input level")
+                    .accessibilityLabel(incoming ? "Listen input level" : "Microphone input level")
                     .accessibilityValue("\(Int(model.level * 100)) percent")
                     .help("Input level")
                 HearingPicker(model: model, incoming: incoming).controlSize(.mini)
                 OutputVolumeControl(model: model, incoming: incoming, compact: true)
             }
+            if !model.pendingRestart.isEmpty { RestartNotice(model: model, compact: true) }
             if timingVisible { PipelineTimingView(model: model, compact: true) }
         }
     }
