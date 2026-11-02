@@ -9,13 +9,16 @@ struct SegmentCutter: Sendable {
     var maximumSeconds = 8.0
     var pauseSeconds = 0.15
     var serviceCommitSeconds = 0.45
+    /// With a value: a short pause after this much speech commits when the transcript ends a sentence.
+    var sentenceSeconds: Double?
     /// Commit at the end of speech too. For a service without its own turn detection.
     var commitsOnSilence = false
     // Whole sample counts at 24 kHz, so repeated packets add up exactly.
     private var segmentSamples = 0, quietSamples = 0
     private var speechLevel: Double = 0
-    /// True when this packet should end the current segment.
-    mutating func commitAfter(_ pcm: Data) -> Bool {
+    /// True when this packet should end the current segment. `sentenceEnded` is true when the latest
+    /// partial transcript ends with sentence punctuation.
+    mutating func commitAfter(_ pcm: Data, sentenceEnded: Bool = false) -> Bool {
         let count = pcm.count / 2
         guard count > 0 else { return false }
         let rms = pcm.withUnsafeBytes { raw -> Double in
@@ -37,7 +40,9 @@ struct SegmentCutter: Sendable {
             defer { segmentSamples = 0 }
             return commitsOnSilence && segmentSamples > 0
         }
-        guard segmentSamples >= samples(maximumSeconds) || (segmentSamples >= samples(minimumSeconds) && quietSamples >= samples(pauseSeconds)) else { return false }
+        let sentence = sentenceEnded && sentenceSeconds.map { segmentSamples >= samples($0) } == true
+        guard segmentSamples >= samples(maximumSeconds)
+              || ((segmentSamples >= samples(minimumSeconds) || sentence) && quietSamples >= samples(pauseSeconds)) else { return false }
         segmentSamples = 0
         return true
     }
@@ -85,6 +90,16 @@ final class URLProviderWebSocket: ProviderWebSocket, @unchecked Sendable {
     func cancel() { socket.cancel(with: .goingAway, reason: nil); session.invalidateAndCancel() }
 }
 
+/// Whether the latest partial transcript ends a sentence. Set by the transcript reader, read by the sender.
+final class SentenceEnd: @unchecked Sendable {
+    private let lock = NSLock(); private var value = false
+    func set(_ ended: Bool) { lock.withLock { value = ended } }
+    func get() -> Bool { lock.withLock { value } }
+    static func ends(_ text: String) -> Bool {
+        guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).last else { return false }
+        return ".!?。！？".contains(last)
+    }
+}
 /// The Delay shared between the main actor and the upload task.
 final class LivePacing: @unchecked Sendable {
     private let lock = NSLock()
@@ -123,6 +138,11 @@ final class RecognitionMailbox: @unchecked Sendable {
     private let mailbox = RecognitionMailbox()
     /// The Delay the sender reads for each packet. A pause the service fixes at connect stays.
     private let livePacing = LivePacing()
+    private let sentenceEnd = SentenceEnd()
+    /// The recognizer reports each partial transcript; one that ends a sentence allows an early commit.
+    func notePartial(_ text: String) { sentenceEnd.set(SentenceEnd.ends(text)) }
+    /// The service committed by itself: the next segment starts without a sentence end.
+    func noteCommitted() { sentenceEnd.set(false) }
     private var socket: (any ProviderWebSocket)?
     private var sender: Task<Void, Never>?, reader: Task<Void, Never>?, consumer: Task<Void, Never>?, watchdog: Task<Void, Never>?
     private(set) var generation = UUID(), active = false, closing = false
@@ -166,18 +186,22 @@ final class RecognitionMailbox: @unchecked Sendable {
         guard let socket else { return }
         self.report = report
         active = true; upload.open()
-        let upload = self.upload, mailbox = self.mailbox, token = generation, livePacing = self.livePacing
+        let upload = self.upload, mailbox = self.mailbox, token = generation, livePacing = self.livePacing, sentenceEnd = self.sentenceEnd
         livePacing.set(pacing)
         sender = Task.detached { [weak self] in
             var cutter = SegmentCutter(minimumSeconds: pacing.minimumSegmentSeconds, maximumSeconds: pacing.maximumSegmentSeconds,
-                                       serviceCommitSeconds: pacing.commitSilenceSeconds, commitsOnSilence: commitsOnSilence)
+                                       serviceCommitSeconds: pacing.commitSilenceSeconds, sentenceSeconds: pacing.sentenceCommitSeconds,
+                                       commitsOnSilence: commitsOnSilence)
             do {
                 for await packet in upload.stream {
                     try Task.checkCancellation()
                     guard ProcessInfo.processInfo.systemUptime - packet.admittedAt <= 5 else { throw ProviderNetworkError.overflow }
                     let current = livePacing.get()
                     cutter.minimumSeconds = current.minimumSegmentSeconds; cutter.maximumSeconds = current.maximumSegmentSeconds
-                    try await send(socket, packet.pcm, cutter.commitAfter(packet.pcm))
+                    cutter.sentenceSeconds = current.sentenceCommitSeconds
+                    let commit = cutter.commitAfter(packet.pcm, sentenceEnded: sentenceEnd.get())
+                    if commit { sentenceEnd.set(false) }
+                    try await send(socket, packet.pcm, commit)
                     upload.complete(packet)
                 }
             } catch { guard !Task.isCancelled else { return }; socket.cancel(); await self?.fail("Speech recognition upload failed.", token: token) }

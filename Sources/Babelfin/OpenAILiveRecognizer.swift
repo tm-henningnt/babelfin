@@ -13,6 +13,8 @@ import BridgeCore
     private var sourceLanguage: String?
     /// Items in the order they appeared, with their partial text, revision and final text.
     private var order: [String] = []
+    /// The members of `order`, for a constant-time check per event.
+    private var ordered: Set<String> = []
     private var partials: [String: (text: String, revision: Int)] = [:]
     private var finals: [String: String] = [:]
     private let finishTimeout: TimeInterval
@@ -70,7 +72,7 @@ import BridgeCore
         /// The event's item, added to the commit order on first sight.
         func recordItem() throws -> String {
             guard let id = object["item_id"] as? String, !id.isEmpty, id.utf8.count <= 128 else { throw ProviderNetworkError.invalidResponse }
-            if !order.contains(id) && finals[id] == nil { order.append(id) }
+            if !ordered.contains(id) && finals[id] == nil { order.append(id); ordered.insert(id) }
             return id
         }
         switch type {
@@ -105,7 +107,7 @@ import BridgeCore
     /// Delivers completed passages in commit order.
     private func releaseFinals(token: UUID) async {
         while token == session.generation, let first = order.first, let text = finals[first] {
-            order.removeFirst(); finals[first] = nil
+            order.removeFirst(); ordered.remove(first); finals[first] = nil
             let revision = (partials.removeValue(forKey: first)?.revision ?? 0) + 1
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
             await onEvent?(.segment(TranscriptSegment(id: "openai-" + first, revision: revision, text: text, isFinal: true, language: sourceLanguage)))

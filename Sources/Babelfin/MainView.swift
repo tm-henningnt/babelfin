@@ -9,19 +9,22 @@ struct HomeView: View {
     var openTranscript: () -> Void
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
-        ScrollView {
+        Page("Home", subtitle: summary) {
             VStack(alignment: .leading, spacing: 18) {
                 ColumnsOrRows(minimumColumnWidth: 350, spacing: 16) {
                     DirectionCard(model: conversation.outgoing, incoming: false)
                     DirectionCard(model: conversation.incoming, incoming: true)
                 }
+                RecorderStatus()
                 TranscriptStrip(conversation: conversation, open: openTranscript)
             }
-            .padding(20)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .onAppear(perform: refresh)
         .onChange(of: scenePhase) { if $0 == .active { refresh() } }
+    }
+    private var summary: String {
+        let speak = conversation.outgoing, listen = conversation.incoming
+        return "Speak: \(speak.languageSummary) · Listen: \(listen.languageSummary)"
     }
     private func refresh() {
         for model in [conversation.outgoing, conversation.incoming] { model.refresh(); model.refreshKeyStatus() }
@@ -108,10 +111,8 @@ private struct DirectionCard: View {
             review
             if !incoming && model.destination == .teams { callReadiness }
         }
-        .padding(18)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(model.active ? model.statusColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: model.active ? 1 : 0.5))
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .panel(padding: 20, highlight: model.active ? model.statusColor : nil)
     }
     private var header: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -144,7 +145,7 @@ private struct DirectionCard: View {
         HStack(spacing: 8) {
             PipelineTimingView(model: model, compact: true)
             Spacer(minLength: 4)
-            Button("Timing…") { popovers.timing = true }.controlSize(.small)
+            Button("Timing…") { popovers.timing = true }
                 .help("Shows how long each stage of the translation takes")
                 .popover(isPresented: $popovers.timing, arrowEdge: .bottom) {
                     PipelineTimingView(model: model).padding(16).frame(width: 460)
@@ -167,7 +168,7 @@ private struct DirectionCard: View {
             }
             Spacer(minLength: 8)
             Button("Change…") { shows.wrappedValue = true }
-                .controlSize(.small)
+                
                 .accessibilityLabel("Change \(incoming ? "Listen" : "Speak") \(title.lowercased())")
                 .popover(isPresented: shows, arrowEdge: .trailing) { content().padding(20).frame(width: 440) }
         }
@@ -190,11 +191,11 @@ private struct DirectionCard: View {
     @ViewBuilder private func reviewAction(for requirement: String) -> some View {
         let lower = requirement.lowercased()
         if lower.contains("key") {
-            OpenSettingsButton(destination: .accounts, title: "Accounts…").controlSize(.small)
+            OpenSettingsButton(destination: .accounts, title: "Accounts…")
         } else if lower.contains("source") || lower.contains("output") || lower.contains("headphones") || lower.contains("reconnect") {
-            Button("Change…") { popovers.audio = true }.controlSize(.small)
+            Button("Change…") { popovers.audio = true }
         } else if lower.contains("voice") || lower.contains("language") {
-            Button("Change…") { popovers.route = true }.controlSize(.small)
+            Button("Change…") { popovers.route = true }
         }
     }
     private var callReadiness: some View {
@@ -341,7 +342,29 @@ struct LevelMeter: View {
 /// The latest transcript lines of both directions: each original with its translation below it.
 private struct TranscriptStrip: View {
     @ObservedObject var conversation: ConversationModel
+    @ObservedObject private var meeting = MeetingModel.shared
+    @AppStorage("babelfin.recorder.notesLanguage") private var notesLanguage = "en"
     var open: () -> Void
+    private var runningNotes: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Notes so far").font(.subheadline.weight(.semibold))
+                if let updated = meeting.runningNotesUpdated {
+                    Text(updated.formatted(date: .omitted, time: .shortened)).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let notes = meeting.runningNotes { Button("Copy") { meeting.copy(notes) }.controlSize(.small) }
+            }
+            if let error = meeting.runningNotesError { Text(error).font(.caption).foregroundStyle(.orange) }
+            if let notes = meeting.runningNotes {
+                NotesView(markdown: notes).font(.callout)
+            } else {
+                Text("The first notes appear after about two minutes of translated speech.").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+    }
     private struct Line: Identifiable {
         let id: String
         let who: String
@@ -351,7 +374,7 @@ private struct TranscriptStrip: View {
     }
     private var lines: [Line] {
         var result: [Line] = []
-        for entry in conversation.transcript.entries where !entry.segment.text.isEmpty {
+        for entry in conversation.transcript.entries.suffix(60) where !entry.segment.text.isEmpty {
             let incoming = entry.direction == .incoming
             if entry.role == .target, let last = result.indices.last, result[last].incoming == incoming, result[last].translation == nil {
                 result[last].translation = entry.segment.text
@@ -367,8 +390,16 @@ private struct TranscriptStrip: View {
             HStack {
                 Label("Transcript", systemImage: "text.bubble").font(.headline)
                 Spacer()
-                Button("Open full transcript", action: open).help("Window › Transcript (⌘2)")
+                Toggle("Running notes", isOn: Binding(get: { meeting.runningNotesOn }, set: { on in
+                    if on { meeting.startRunningNotes(language: notesLanguage) { conversation.transcript.plainText(selection: .both) } }
+                    else { meeting.stopRunningNotes() }
+                }))
+                .toggleStyle(.switch).controlSize(.small)
+                .accessibilityLabel("Running notes")
+                .help("Notes of the meeting so far, every two minutes. OpenAI receives the transcript at each update.")
+                Button("Open full transcript", action: open).help("Window › Live transcript (⌘2)")
             }
+            if meeting.runningNotesOn || meeting.runningNotes != nil || meeting.runningNotesError != nil { runningNotes }
             if lines.isEmpty {
                 Text("Translated speech appears here while a direction translates. It stays in memory until you clear it or quit.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -387,8 +418,29 @@ private struct TranscriptStrip: View {
                 }
             }
         }
-        .padding(18)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
+        .panel(padding: 20)
+    }
+}
+
+/// Home: the recorder's state while a recording exists, with a link to the Record page.
+private struct RecorderStatus: View {
+    @ObservedObject private var recorder = MeetingRecorder.shared
+    var body: some View {
+        if recorder.state != .idle {
+            HStack(spacing: 12) {
+                Image(systemName: recorder.state == .recording ? "record.circle.fill" : "record.circle")
+                    .font(.title2).foregroundStyle(recorder.state == .recording ? Color.red : Color.secondary)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(recorder.state == .recording ? "Recording" : "Recording stopped").font(.headline)
+                    Text("\(RecorderCard.clock(recorder.seconds)) · \(recorder.kind == .online ? "microphone and meeting audio" : "microphone")")
+                        .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                }
+                Spacer()
+                if recorder.state == .recording { Button("Stop") { recorder.stop() }.controlSize(.large) }
+                Button("Open Recorder") { MainNavigation.shared.section = .record }.controlSize(.large)
+            }
+            .panel(highlight: recorder.state == .recording ? .red : nil)
+        }
     }
 }

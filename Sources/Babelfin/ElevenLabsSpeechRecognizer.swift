@@ -67,6 +67,7 @@ import BridgeCore
             lastTranscriptAt = ProcessInfo.processInfo.systemUptime
             let final = type == "committed_transcript"
             unresolvedPartial = !final && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if final { session.noteCommitted() } else { session.notePartial(text) }
             let segment = TranscriptSegment(id: segmentID, revision: revision, text: text, isFinal: final, language: sourceLanguage)
             // Increment only after the final callback drains: finish must not outrun the transcript consumer.
             await onEvent?(.segment(segment))

@@ -18,7 +18,7 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 } header: { Text("Translation") }
                 Section {
-                    Toggle("Speak the translation", isOn: $model.speakTranslation).disabled(model.configurationLocked)
+                    Toggle("Speak the translation", isOn: $model.speakTranslation).disabled(model.configurationLocked).accessibilityLabel("Speak the translation")
                     Text(model.speakTranslation
                          ? "You hear a translated voice."
                          : "Text only: you hear the original audio and read the translation as subtitles (Translation › Show Subtitles) or in the transcript. Speech services are not used.")
@@ -26,7 +26,7 @@ struct SettingsView: View {
                 } header: { Text("Output") }
                 if model.speakTranslation { VoiceSettingsView(model: model, allAudioStopped: allAudioStopped) }
                 Section {
-                    Toggle("Mix in original audio", isOn: $model.originalMixEnabled)
+                    Toggle("Mix in original audio", isOn: $model.originalMixEnabled).accessibilityLabel("Mix in original audio")
                     if model.originalMixEnabled {
                         HStack(spacing: 12) {
                             Text("Original volume")
@@ -34,7 +34,7 @@ struct SettingsView: View {
                             Text(model.originalMixLevel, format: .percent.precision(.fractionLength(0)))
                                 .monospacedDigit().frame(width: 42, alignment: .trailing)
                         }
-                        Toggle("Lower original audio while translation plays", isOn: $model.originalMixDucking)
+                        Toggle("Lower original audio while translation plays", isOn: $model.originalMixDucking).accessibilityLabel("Lower original audio while translation plays")
                     }
                 } header: { Text("Original audio") }
                     .disabled(model.configurationLocked)

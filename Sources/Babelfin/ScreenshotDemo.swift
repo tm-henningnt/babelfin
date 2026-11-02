@@ -42,6 +42,7 @@ import BridgeCore
         incoming.destination = .listen
         let conversation = ConversationModel(outgoing: model(outgoingPreferences), incoming: incoming)
         conversation.seedDemoTranscript()
+        MeetingModel.shared.seedDemo()
         // Twelve fictional passages, so the timing view has a history to draw.
         let translate = [0.42, 0.38, 0.51, 0.36, 0.44, 0.40, 0.62, 0.39, 0.41, 0.37, 0.45, 0.40]
         let voice = [0.55, 0.61, 0.58, 0.49, 0.72, 0.57, 0.66, 0.52, 0.60, 0.54, 0.58, 0.56]

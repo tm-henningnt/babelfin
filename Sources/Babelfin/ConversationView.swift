@@ -24,17 +24,19 @@ struct ConversationView: View {
 
 /// Settings: five tabs. The live controls are on Home; Settings holds what changes rarely.
 struct ConversationSettingsView: View {
-    @ObservedObject var conversation: ConversationModel
+    /// Not observed here: the model publishes every level change of both directions, and a redraw
+    /// of the TabView moves its toolbar icons. Each tab observes what it shows.
+    let conversation: ConversationModel
     @StateObject private var navigation: SettingsNavigationState
     init(conversation: ConversationModel, initialDestination: SettingsDestination? = nil) {
         self.conversation = conversation
         _navigation = StateObject(wrappedValue: SettingsNavigationState(selection: initialDestination ?? SettingsRequest.destination ?? .general))
     }
     var body: some View {
-        TabView(selection: Binding(get: { navigation.selection.tab }, set: { navigation.selection = $0 })) {
+        TabView(selection: $navigation.selection) {
             GeneralSettingsView(conversation: conversation)
                 .tabItem { Label("General", systemImage: "gearshape") }.tag(SettingsDestination.general)
-            AccountSettingsView(allAudioStopped: { !conversation.locked })
+            AccountsTab(conversation: conversation)
                 .tabItem { Label("Accounts", systemImage: "key") }.tag(SettingsDestination.accounts)
             DeviceSettingsView(conversation: conversation)
                 .tabItem { Label("Audio devices", systemImage: "hifispeaker.2") }.tag(SettingsDestination.audioDevices)
@@ -50,6 +52,12 @@ struct ConversationSettingsView: View {
             if let destination = notification.object as? SettingsDestination { navigation.apply(destination) }
         }
     }
+}
+
+/// Settings › Accounts, redrawn when translation starts or stops, so key edits lock while audio runs.
+private struct AccountsTab: View {
+    @ObservedObject var conversation: ConversationModel
+    var body: some View { AccountSettingsView(allAudioStopped: { !conversation.locked }) }
 }
 
 /// A Settings tab, or a page inside Languages and services.
@@ -80,6 +88,7 @@ enum SettingsDestination: Hashable {
 /// then the windows. A window-style menu bar extra can hold sliders; a plain menu cannot.
 struct ConversationMenu: View {
     @ObservedObject var conversation: ConversationModel
+    @ObservedObject private var recorder = MeetingRecorder.shared
     @ObservedObject private var subtitles = SubtitleOverlay.shared
     @Environment(\.openWindow) private var openWindow
     var body: some View {
@@ -88,6 +97,10 @@ struct ConversationMenu: View {
             Divider().padding(.vertical, 6)
             MenuBarDirection(model: conversation.incoming, title: "Listen", shortcut: "⌥⇧⌘T")
             Divider().padding(.vertical, 6)
+            if recorder.state == .recording {
+                row("Stop Recording (\(RecorderCard.clock(recorder.seconds)))") { recorder.stop() }
+                Divider().padding(.vertical, 6)
+            }
             row("Open Babelfin", shortcut: "⌘1") { MainNavigation.open(.home, openWindow: openWindow) }
             row("Transcript", shortcut: "⌘2") { MainNavigation.open(.transcript, openWindow: openWindow) }
             row(subtitles.visible ? "Hide Subtitles" : "Show Subtitles", shortcut: "⌥⌘U") { subtitles.toggle() }

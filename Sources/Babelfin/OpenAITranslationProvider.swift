@@ -31,7 +31,7 @@ final class URLTranslationWebSocket: TranslationWebSocket, @unchecked Sendable {
         settings.httpCookieStorage = nil
         session = URLSession(configuration: settings, delegate: SocketRedirectPolicy(), delegateQueue: nil)
         socket = session.webSocketTask(with: request)
-        socket.maximumMessageSize = 400_000
+        socket.maximumMessageSize = 800_000
         socket.resume()
     }
     func send(_ text: String) async throws {
@@ -134,8 +134,9 @@ typealias OpenAITranslationProvider = RealtimeTranslationProvider
     private var controlConsumer: Task<Void, Never>?
     nonisolated private let controls = TranslationControlChannel()
     nonisolated private let upload = BoundedPCMChannel()
-    // Separate from the two-second render budget; includes the entire in-flight event.
-    nonisolated private let received = BoundedPCMChannel(maximumFrames: 120_000, maximumPackets: 1024)
+    // Separate from the two-second render budget; includes the entire in-flight event. Ten seconds
+    // admits a service burst; the stale check still ends a session that falls behind.
+    nonisolated private let received = BoundedPCMChannel(maximumFrames: 240_000, maximumPackets: 2048)
     nonisolated private let receiveTiming = ReceivedTiming()
     private var generation = UUID()
     private var started = false
@@ -283,14 +284,15 @@ typealias OpenAITranslationProvider = RealtimeTranslationProvider
     }
     nonisolated private static func readEvents(_ socket: any TranslationWebSocket, _ wire: any RealtimeTranslationWire) async throws -> [TranslationEnvelope] {
         let data = try await socket.receive()
-        guard data.count <= 400_000 else { throw BridgeError.invalidEvent }
+        // Ten seconds of base64 PCM16 at 24 kHz is 640 kB.
+        guard data.count <= 800_000 else { throw BridgeError.invalidEvent }
         return try wire.decode(data)
     }
     nonisolated func append(_ pcm: Data) throws { try upload.append(pcm) }
     private func receiveOverflow(oversized: Bool, token: UUID) async -> Bool {
         guard token == generation else { return true }
         if closing { return false }
-        await fail(oversized ? "audio_burst_exceeds_five_seconds" : "received_audio_backlog", token: token)
+        await fail(oversized ? "audio_burst_too_long" : "received_audio_backlog", token: token)
         return true
     }
     private func acceptControl(_ envelope: TranslationEnvelope, token: UUID) async -> Bool {

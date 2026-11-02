@@ -29,13 +29,6 @@ struct SpeechToolsView: View {
                 Divider()
             }
             VStack(spacing: 0) {
-                if !showsSidebar {
-                    Picker("Tool", selection: Binding(get: { model.page ?? .voice }, set: { model.page = $0 })) {
-                        ForEach([SpeechToolsPage.voice, .recording, .notes]) { page in Label(page.title, systemImage: page.symbol).tag(page) }
-                    }
-                    .pickerStyle(.segmented).labelsHidden().fixedSize()
-                    .padding(.top, 16).padding(.bottom, 4)
-                }
                 Group {
                     switch model.page ?? .recording {
                     case .recording: recordingPage
@@ -87,17 +80,18 @@ struct SpeechToolsView: View {
                         ForEach(TranslationLanguage.elevenLabsOutputs) { Text($0.name).tag($0.code) }
                     }.disabled(model.busy)
                     if model.recordingService == .elevenLabs {
-                        Toggle("Label different speakers", isOn: $model.diarize).disabled(model.busy)
+                        Toggle("Label different speakers", isOn: $model.diarize).disabled(model.busy).accessibilityLabel("Label different speakers")
                             .help("Labels distinguish voices in this recording. They do not identify people.")
                     }
                     HStack {
-                        Text("\(model.recordingService.title) receives the audio when you choose Transcribe.")
+                        Text(model.recordingService == .onThisMac ? "The recording stays on this Mac. Choose its language; there are no speaker labels."
+                             : "\(model.recordingService.title) receives the audio when you choose Transcribe.")
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 12)
                         Button("Transcribe") { model.transcribe() }.buttonStyle(.borderedProminent)
-                            .disabled(model.busy || model.audioSource == nil || model.missingKeys.contains(model.recordingService.account))
+                            .disabled(model.busy || model.audioSource == nil || (model.recordingService.account.map(model.missingKeys.contains) ?? false))
                     }
-                    missingKey(model.recordingService.account)
+                    if let account = model.recordingService.account { missingKey(account) }
                 }
                 if let recording = model.recording, !recording.segments.isEmpty {
                     Section {
@@ -114,7 +108,7 @@ struct SpeechToolsView: View {
                     }
                     if recording.targetLanguage != nil {
                         Section {
-                            Toggle("Keep the original under the dub", isOn: $model.dubIncludesOriginal).disabled(model.busy)
+                            Toggle("Keep the original under the dub", isOn: $model.dubIncludesOriginal).disabled(model.busy).accessibilityLabel("Keep the original under the dub")
                             HStack {
                                 Button("Create dub") { model.createDub() }
                                     .disabled(!model.canDub || model.voiceKeyMissing)
@@ -135,6 +129,15 @@ struct SpeechToolsView: View {
                             Menu("Save…") {
                                 Button("Plain text…") { model.saveRecording(json: false) }
                                 Button("Structured transcript (JSON)…") { model.saveRecording(json: true) }
+                                if recording.segments.contains(where: { $0.startSeconds != nil }) {
+                                    Divider()
+                                    ForEach(SubtitleFile.Format.allCases, id: \.self) { format in
+                                        Button("Subtitles, original (\(format.rawValue.uppercased()))…") { model.saveSubtitles(format, text: .original) }
+                                        if recording.targetLanguage != nil {
+                                            Button("Subtitles, translation (\(format.rawValue.uppercased()))…") { model.saveSubtitles(format, text: .translation) }
+                                        }
+                                    }
+                                }
                             }.fixedSize()
                             Spacer(minLength: 8)
                             Button("Make notes…") { model.useRecordingForNotes() }
@@ -147,7 +150,7 @@ struct SpeechToolsView: View {
                             .foregroundStyle(.secondary).padding(.vertical, 12)
                     } header: { Text("Transcript") }
                 }
-            }.formStyle(.grouped)
+            }.formStyle(.grouped).scrollContentBackground(.hidden)
         }
     }
 
@@ -185,8 +188,8 @@ struct SpeechToolsView: View {
                             Spacer()
                         }.disabled(model.busy)
                         ScrollView {
-                            Text(notes.text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                        }.frame(minHeight: 140, maxHeight: 260)
+                            NotesView(markdown: notes.text).frame(maxWidth: .infinity, alignment: .leading)
+                        }.frame(minHeight: 160, maxHeight: 360)
                         Text(notes.isComplete ? "All supplied text was processed. Review the notes before sharing." : "These notes cover only part of the supplied text.")
                             .font(.caption).foregroundStyle(.secondary)
                     } else {
@@ -194,7 +197,7 @@ struct SpeechToolsView: View {
                             .foregroundStyle(.secondary).padding(.vertical, 16)
                     }
                 } header: { Text("Notes") }
-            }.formStyle(.grouped)
+            }.formStyle(.grouped).scrollContentBackground(.hidden)
         }
     }
 
@@ -231,7 +234,7 @@ struct SpeechToolsView: View {
                     if model.voiceSource == .text {
                         HStack {
                             Slider(value: $model.voiceSpeed, in: SpeechDirection.speeds, step: 0.05) { Text("Speed") }
-                                .accessibilityValue("\(speedText) times")
+                                .accessibilityLabel("Speed").accessibilityValue("\(speedText) times")
                             Text("\(speedText)×").monospacedDigit().frame(width: 48, alignment: .trailing)
                         }
                     }
@@ -259,7 +262,18 @@ struct SpeechToolsView: View {
                                 TagButtons { model.appendTag($0) }.disabled(model.busy)
                             }
                         }
+                        Toggle("Translate into \(voiceLanguageName) first", isOn: $model.voiceTranslates).disabled(model.busy).accessibilityLabel("Translate into \(voiceLanguageName) first")
+                        if let spoken = model.spokenText {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(spoken).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                                Spacer(minLength: 8)
+                                Button("Copy") { model.copy(spoken) }.controlSize(.small)
+                            }
+                        }
+                        if model.voiceTranslates, model.missingKeys.contains(.openAI) { missingKey(.openAI) }
                         HStack {
+                            Button("Paste") { if let text = NSPasteboard.general.string(forType: .string) { model.voiceText = String(text.prefix(SpeechToolsLimits.voiceCharacters)) } }
+                                .disabled(model.busy).help("Replace the text with the clipboard")
                             Text("\(model.voiceText.count.formatted()) / 2,000 characters")
                                 .foregroundStyle(model.voiceText.count > SpeechToolsLimits.voiceCharacters ? Color.orange : Color.secondary)
                                 .font(.caption).monospacedDigit()
@@ -271,12 +285,10 @@ struct SpeechToolsView: View {
                             Text("This text is too long for one clip. Shorten it, then generate again.")
                                 .font(.caption).foregroundStyle(.orange)
                         }
-                        Text(model.voiceProvider == .system ? "The text stays on this Mac."
-                             : "\(model.voiceProvider.displayName) receives this text for speech generation.")
-                            .font(.caption).foregroundStyle(.secondary)
+                        Text(textPrivacy).font(.caption).foregroundStyle(.secondary)
                     } header: { Text("Words to speak") }
                 }
-            }.formStyle(.grouped)
+            }.formStyle(.grouped).scrollContentBackground(.hidden)
             // The takes and the player stay in view below the form.
             if !model.takes.isEmpty {
                 Divider()
@@ -323,6 +335,16 @@ struct SpeechToolsView: View {
         return "Speaks the translation at the original times with the voice and delivery from Voice clip. " + upload
     }
 
+    private var textPrivacy: String {
+        let speech = model.voiceProvider == .system ? "The system voice speaks it on this Mac."
+            : "\(model.voiceProvider.displayName) receives the text to speak it."
+        if model.voiceTranslates { return "OpenAI receives the text to translate it. " + speech }
+        if model.voiceProvider == .system { return "The text stays on this Mac. " + speech }
+        return speech
+    }
+    private var voiceLanguageName: String {
+        model.voiceLanguages.first { $0.code == model.voiceLanguage }?.name ?? "the clip language"
+    }
     private var speedText: String { String(format: "%.2f", model.voiceSpeed) }
 
     private var deliveryHelp: String {
@@ -405,7 +427,12 @@ struct SpeechToolsView: View {
             }
         }
     }
-    private var operationStatus: some View {
+    /// Shows progress or the last notice. In the main window, where the status bar sits below, it
+    /// shows nothing while idle; the standalone window keeps the privacy line.
+    @ViewBuilder private var operationStatus: some View {
+        if model.busy || !model.notice.isEmpty || showsSidebar { statusLine }
+    }
+    private var statusLine: some View {
         VStack(spacing: 0) {
             Divider()
             HStack(spacing: 10) {

@@ -33,7 +33,19 @@ enum ProviderNetworkError: LocalizedError, Sendable, TranslationFailureDiagnosin
 protocol ProviderHTTPTransport: Sendable {
     func stream(_ request: URLRequest, maximumBytes: Int, contentTypes: Set<String>,
                 onChunk: @escaping @Sendable (Data) async throws -> Void) async throws
+    /// The same, with the request body read from `file` as it is sent.
+    func upload(_ request: URLRequest, fromFile file: URL, maximumBytes: Int, contentTypes: Set<String>,
+                onChunk: @escaping @Sendable (Data) async throws -> Void) async throws
     func cancel()
+}
+extension ProviderHTTPTransport {
+    /// For transports without file uploads, such as fixtures: the body is read into the request.
+    func upload(_ request: URLRequest, fromFile file: URL, maximumBytes: Int, contentTypes: Set<String>,
+                onChunk: @escaping @Sendable (Data) async throws -> Void) async throws {
+        var request = request
+        request.httpBody = try Data(contentsOf: file)
+        try await stream(request, maximumBytes: maximumBytes, contentTypes: contentTypes, onChunk: onChunk)
+    }
 }
 
 private final class HTTPAccumulator: @unchecked Sendable {
@@ -51,23 +63,42 @@ extension ProviderHTTPTransport {
     }
 }
 
-/// A separate session per request prevents cookies/cache or redirects from moving credentials.
-/// The delegate admits at most 240kB (five seconds of PCM), including the current sink callback.
-/// Fast synthesis waits for that sink instead of treating ordinary backpressure as overflow.
-/// URLSession owns the currently delivered Data; it is sliced into the bounded application queue.
+/// One URLSession per transport keeps the TLS connections to a provider open between requests.
+/// It has no cookie store or cache, and it refuses redirects, so credentials stay with the host
+/// they were sent to. Each request admits up to 240 kB (five seconds of PCM) ahead of its sink:
+/// above that the task is suspended, and it resumes when the sink has taken half of it. A request
+/// whose sink makes no progress for five seconds while suspended fails with a timeout.
 final class URLProviderHTTPTransport: ProviderHTTPTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var operations: [UUID: HTTPStreamOperation] = [:]
-    private let configuration: URLSessionConfiguration?
-    init(configuration: URLSessionConfiguration? = nil) { self.configuration = configuration?.copy() as? URLSessionConfiguration }
+    private let router = HTTPSessionRouter()
+    private let session: URLSession
+    /// `requestTimeout` is the longest wait for data; `resourceTimeout` the longest whole request. Live
+    /// translation keeps 20 s and 90 s; a meeting upload waits while the service transcribes.
+    init(configuration: URLSessionConfiguration? = nil, requestTimeout: TimeInterval = 20, resourceTimeout: TimeInterval = 90) {
+        let config = (configuration?.copy() as? URLSessionConfiguration) ?? URLSessionConfiguration.ephemeral
+        config.urlCache = nil; config.httpCookieStorage = nil
+        config.timeoutIntervalForRequest = requestTimeout; config.timeoutIntervalForResource = resourceTimeout
+        let queue = OperationQueue(); queue.maxConcurrentOperationCount = 1
+        session = URLSession(configuration: config, delegate: router, delegateQueue: queue)
+    }
+    deinit { session.invalidateAndCancel() }
     func stream(_ request: URLRequest, maximumBytes: Int, contentTypes: Set<String>,
                 onChunk: @escaping @Sendable (Data) async throws -> Void) async throws {
-        let id = UUID(), operation = HTTPStreamOperation(maximumBytes: maximumBytes, contentTypes: contentTypes, configuration: configuration)
+        try await run(maximumBytes: maximumBytes, contentTypes: contentTypes, onChunk: onChunk) { $0.dataTask(with: request) }
+    }
+    func upload(_ request: URLRequest, fromFile file: URL, maximumBytes: Int, contentTypes: Set<String>,
+                onChunk: @escaping @Sendable (Data) async throws -> Void) async throws {
+        try await run(maximumBytes: maximumBytes, contentTypes: contentTypes, onChunk: onChunk) { $0.uploadTask(with: request, fromFile: file) }
+    }
+    private func run(maximumBytes: Int, contentTypes: Set<String>, onChunk: @escaping @Sendable (Data) async throws -> Void,
+                     task: @escaping @Sendable (URLSession) -> URLSessionDataTask) async throws {
+        let id = UUID(), operation = HTTPStreamOperation(maximumBytes: maximumBytes, contentTypes: contentTypes)
         register(operation, id: id)
         defer { remove(id) }
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            operation.start(request)
+            operation.start(task(session), router: router)
             do {
                 for try await packet in operation.stream {
                     try Task.checkCancellation()
@@ -91,117 +122,139 @@ final class URLProviderHTTPTransport: ProviderHTTPTransport, @unchecked Sendable
     func cancel() { lock.lock(); let active = Array(operations.values); lock.unlock(); active.forEach { $0.cancel() } }
 }
 
-private final class HTTPStreamOperation: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+/// The session's delegate: hands each task's events to the operation that started it.
+private final class HTTPSessionRouter: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var operations: [Int: HTTPStreamOperation] = [:]
+    func register(_ operation: HTTPStreamOperation, for task: URLSessionTask) { lock.withLock { operations[task.taskIdentifier] = operation } }
+    private func operation(_ task: URLSessionTask) -> HTTPStreamOperation? { lock.withLock { operations[task.taskIdentifier] } }
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil); operation(task)?.refuseRedirect()
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let operation = operation(dataTask) else { completionHandler(.cancel); return }
+        completionHandler(operation.accept(response) ? .allow : .cancel)
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        operation(dataTask)?.receive(data)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let finished = lock.withLock { operations.removeValue(forKey: task.taskIdentifier) }
+        finished?.completed(error: error)
+    }
+}
+
+private final class HTTPStreamOperation: @unchecked Sendable {
     struct Packet: Sendable { let id: UUID; let data: Data }
+    static let admittedBytes = 240_000
+    static let stallSeconds: TimeInterval = 5
     let stream: AsyncThrowingStream<Packet, Error>
     private let continuation: AsyncThrowingStream<Packet, Error>.Continuation
-    private let condition = NSCondition()
+    private let lock = NSLock()
     private let maximumBytes: Int
     private let contentTypes: Set<String>
-    private let configuration: URLSessionConfiguration?
     private var tickets: [UUID: Int] = [:]
     private var queued = 0, received = 0, completedPackets = 0
     private var ended = false
     private var terminalFailure: ProviderNetworkError?
     private var acceptedResponse = false
-    private var session: URLSession?
-    init(maximumBytes: Int, contentTypes: Set<String>, configuration: URLSessionConfiguration?) {
-        self.maximumBytes = maximumBytes; self.contentTypes = contentTypes; self.configuration = configuration
-        var captured: AsyncThrowingStream<Packet, Error>.Continuation!
-        stream = AsyncThrowingStream(bufferingPolicy: .bufferingOldest(64)) { captured = $0 }
-        continuation = captured
+    private var task: URLSessionDataTask?
+    private var suspended = false
+    private var watch: DispatchSourceTimer?
+    init(maximumBytes: Int, contentTypes: Set<String>) {
+        self.maximumBytes = maximumBytes; self.contentTypes = contentTypes
+        // Bounded by `maximumBytes`: every byte the delegate receives is admitted once.
+        (stream, continuation) = AsyncThrowingStream.makeStream(of: Packet.self, bufferingPolicy: .unbounded)
     }
-    func start(_ request: URLRequest) {
-        condition.lock(); defer { condition.unlock() }
-        guard !ended else { return }
-        let config = (configuration?.copy() as? URLSessionConfiguration) ?? URLSessionConfiguration.ephemeral
-        config.urlCache = nil; config.httpCookieStorage = nil
-        config.timeoutIntervalForRequest = 20; config.timeoutIntervalForResource = 90
-        let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-        self.session = session
-        session.dataTask(with: request).resume()
+    func start(_ task: URLSessionDataTask, router: HTTPSessionRouter) {
+        lock.lock(); defer { lock.unlock() }
+        guard !ended else { task.cancel(); return }
+        self.task = task
+        router.register(self, for: task)
+        task.resume()
     }
+    /// The sink took a packet: frees its bytes and resumes a suspended task below half the limit.
     func complete(_ packet: Packet) {
-        condition.lock()
-        if let count = tickets.removeValue(forKey: packet.id) {
-            queued -= count; completedPackets += 1
-            condition.broadcast()
-        }
-        condition.unlock()
+        lock.lock()
+        guard let count = tickets.removeValue(forKey: packet.id) else { lock.unlock(); return }
+        queued -= count; completedPackets += 1
+        let drained = queued <= Self.admittedBytes / 2
+        if drained { watch?.cancel(); watch = nil }
+        let resume = suspended && !ended && drained
+        if resume { suspended = false }
+        let task = self.task
+        lock.unlock()
+        if resume { task?.resume() }
     }
     func checkFailure() throws {
-        condition.lock(); let error = terminalFailure; condition.unlock()
+        lock.lock(); let error = terminalFailure; lock.unlock()
         if let error { throw error }
     }
     func cancel() {
-        condition.lock(); terminalFailure = terminalFailure ?? .cancelled; condition.broadcast(); condition.unlock()
+        lock.lock(); terminalFailure = terminalFailure ?? .cancelled; lock.unlock()
         end(ProviderNetworkError.cancelled)
     }
-    private func end(_ error: ProviderNetworkError? = nil) {
-        condition.lock()
-        guard !ended else { condition.unlock(); return }
-        ended = true; terminalFailure = error; let oldSession = session; session = nil
-        condition.broadcast()
-        condition.unlock()
-        if let error { continuation.finish(throwing: error); oldSession?.invalidateAndCancel() }
-        else { continuation.finish(); oldSession?.finishTasksAndInvalidate() }
-    }
-    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
-        completionHandler(nil); end(ProviderNetworkError.invalidResponse)
-    }
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
-                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        guard let http = response as? HTTPURLResponse else { completionHandler(.cancel); end(ProviderNetworkError.invalidResponse); return }
-        guard (200...299).contains(http.statusCode) else { completionHandler(.cancel); end(ProviderNetworkError.http(http.statusCode)); return }
+    func refuseRedirect() { end(ProviderNetworkError.invalidResponse) }
+    func accept(_ response: URLResponse) -> Bool {
+        guard let http = response as? HTTPURLResponse else { end(ProviderNetworkError.invalidResponse); return false }
+        guard (200...299).contains(http.statusCode) else { end(ProviderNetworkError.http(http.statusCode)); return false }
         let type = (http.mimeType ?? "").lowercased()
         guard contentTypes.contains(type), response.expectedContentLength <= Int64(maximumBytes) else {
-            completionHandler(.cancel); end(ProviderNetworkError.invalidResponse); return
+            end(ProviderNetworkError.invalidResponse); return false
         }
-        condition.lock(); acceptedResponse = true; condition.unlock(); completionHandler(.allow)
+        lock.withLock { acceptedResponse = true }
+        return true
     }
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        condition.lock()
-        guard !ended, acceptedResponse else { condition.unlock(); return }
-        guard data.count <= maximumBytes - received else {
-            condition.unlock(); end(ProviderNetworkError.overflow); return
-        }
+    /// Runs on the session's serial delegate queue and never waits: a slow sink suspends the task.
+    func receive(_ data: Data) {
+        lock.lock()
+        guard !ended, acceptedResponse else { lock.unlock(); return }
+        guard data.count <= maximumBytes - received else { lock.unlock(); end(ProviderNetworkError.overflow); return }
         received += data.count
         for offset in stride(from: 0, to: data.count, by: 4_800) {
-            let count = min(4_800, data.count - offset)
-            var progress = completedPackets
-            var deadline = Date(timeIntervalSinceNow: 5)
-            let needsCapacity = count > 240_000 - queued || tickets.count >= 64
-            if needsCapacity { dataTask.suspend() }
-            // This callback runs on this request's dedicated serial delegate queue,
-            // never the main actor or the async sink executor. Waiting here prevents
-            // more delegate data from being admitted while playback drains. Suspending
-            // the task also slows network reads; already-dispatched callbacks still
-            // pass this admission gate. Cancel broadcasts independently, so it cannot
-            // depend on another delegate event.
-            while !ended, count > 240_000 - queued || tickets.count >= 64 {
-                let signalled = condition.wait(until: deadline)
-                if completedPackets != progress {
-                    progress = completedPackets; deadline = Date(timeIntervalSinceNow: 5)
-                } else if !signalled, !ended {
-                    condition.unlock(); end(ProviderNetworkError.timedOut); return
-                }
-            }
-            guard !ended else { condition.unlock(); return }
-            if needsCapacity { dataTask.resume() }
-            let bytes = data.subdata(in: offset..<(offset + count))
+            let bytes = data.subdata(in: offset..<min(offset + 4_800, data.count))
             let packet = Packet(id: UUID(), data: bytes)
             tickets[packet.id] = bytes.count; queued += bytes.count
-            switch continuation.yield(packet) {
-            case .enqueued: break
-            default: condition.unlock(); end(ProviderNetworkError.overflow); return
-            }
+            continuation.yield(packet)
         }
-        condition.unlock()
+        if queued > Self.admittedBytes, watch == nil { armWatch(progress: completedPackets) }
+        let suspend = !suspended && queued > Self.admittedBytes
+        if suspend { suspended = true }
+        let task = self.task
+        lock.unlock()
+        if suspend { task?.suspend() }
     }
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if error != nil { end(ProviderNetworkError.transport) }
-        else { end() }
+    /// While more than the admitted bytes wait, fails the request if the sink takes no packet within
+    /// `stallSeconds`, also when the network part of the response has already ended.
+    private func armWatch(progress: Int) {
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + Self.stallSeconds, leeway: .milliseconds(10))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            guard self.queued > Self.admittedBytes / 2, self.terminalFailure == nil else { self.watch = nil; self.lock.unlock(); return }
+            if self.completedPackets != progress { let now = self.completedPackets; self.armWatch(progress: now); self.lock.unlock(); return }
+            self.terminalFailure = .timedOut; self.watch = nil
+            self.lock.unlock()
+            self.end(ProviderNetworkError.timedOut)
+        }
+        watch?.cancel()
+        watch = timer
+        timer.resume()
+    }
+    func completed(error: Error?) {
+        if error != nil { end(ProviderNetworkError.transport) } else { end() }
+    }
+    private func end(_ error: ProviderNetworkError? = nil) {
+        lock.lock()
+        guard !ended else { lock.unlock(); return }
+        ended = true; terminalFailure = terminalFailure ?? error
+        if error != nil { watch?.cancel(); watch = nil }
+        let task = self.task; self.task = nil
+        lock.unlock()
+        if let error { continuation.finish(throwing: error); task?.cancel() } else { continuation.finish() }
     }
 }
 

@@ -24,6 +24,17 @@ import BridgeCore
         if policy == .regular { NSApp.activate(ignoringOtherApps: true) }
     }
     func applicationWillTerminate(_ notification: Notification) { Self.onQuit?() }
+    /// Quitting deletes a meeting recording, so Babelfin asks first.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let recorder = MeetingRecorder.shared
+        guard recorder.state == .recording || recorder.hasRecording else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = recorder.state == .recording ? "A meeting is being recorded" : "You have a meeting recording"
+        alert.informativeText = "Quitting deletes the recording. Save the audio or transcribe it first to keep it."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete and Quit").hasDestructiveAction = true
+        return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 
@@ -52,10 +63,14 @@ import BridgeCore
         let instance = ConversationModel()
         for model in [instance.outgoing, instance.incoming] { model.keyDiagnosis = { await KeyCheckStore.shared.diagnose($0) } }
         #endif
+        MeetingRecorder.shared.recoverLeftovers()
         let callPrompt = CallPromptController(model: instance.outgoing)
         SubtitleOverlay.shared.attach(instance)
+        MeetingModel.shared.conversation = instance
+        LiveTranscriptExporter.shared.start(instance)
+        SpeechToolsModel.autoExport = { AutoExport.export($0, name: $1, date: Date()) }
         _conversation = StateObject(wrappedValue: instance)
-        AppDelegate.onQuit = { callPrompt.close(); instance.abort() }
+        AppDelegate.onQuit = { callPrompt.close(); instance.abort(); MeetingRecorder.shared.discard(); MeetingModel.shared.stopRunningNotes() }
     }
     var body: some Scene {
         Window("Babelfin", id: "main") { ConversationView(conversation: conversation) }
@@ -82,9 +97,9 @@ import BridgeCore
                     SubtitleToggleButton().keyboardShortcut("u", modifiers: [.command, .option])
                 }
                 CommandGroup(before: .windowList) {
-                    SectionButton(section: .home).keyboardShortcut("1")
-                    SectionButton(section: .transcript).keyboardShortcut("2")
-                    SectionButton(section: .tools).keyboardShortcut("3")
+                    ForEach(Array(MainSection.allCases.enumerated()), id: \.element) { index, section in
+                        SectionButton(section: section).keyboardShortcut(KeyEquivalent(Character("\(index + 1)")))
+                    }
                     CompactButton().keyboardShortcut("0")
                     Divider()
                 }
@@ -102,13 +117,7 @@ import BridgeCore
         // Private documentation build only: the menu bar panel in a window, for screenshots.
         Window("Menu Bar Panel", id: "menu-preview") { ConversationMenu(conversation: conversation) }.windowResizability(.contentSize)
         #endif
-        MenuBarExtra { ConversationMenu(conversation: conversation) } label: {
-            Label {
-                Text(conversation.active ? "Babelfin active" : "Babelfin stopped")
-            } icon: {
-                Image(nsImage: conversation.active ? MenuBarSymbol.live : MenuBarSymbol.idle).renderingMode(.template)
-            }
-        }
+        MenuBarExtra { ConversationMenu(conversation: conversation) } label: { MenuBarLabel(conversation: conversation) }
         .menuBarExtraStyle(.window)
     }
 }
@@ -185,6 +194,23 @@ extension MainNavigation {
         }
     }
 }
+/// The menu bar icon: the fish while idle or translating, a record symbol while recording.
+private struct MenuBarLabel: View {
+    @ObservedObject var conversation: ConversationModel
+    @ObservedObject private var recorder = MeetingRecorder.shared
+    var body: some View {
+        if recorder.state == .recording {
+            Label("Babelfin recording", systemImage: "record.circle.fill")
+        } else {
+            Label {
+                Text(conversation.active ? "Babelfin active" : "Babelfin stopped")
+            } icon: {
+                Image(nsImage: conversation.active ? MenuBarSymbol.live : MenuBarSymbol.idle).renderingMode(.template)
+            }
+        }
+    }
+}
+
 /// Restarts each direction that has changes waiting for a restart.
 struct RestartBothButton: View {
     @ObservedObject var conversation: ConversationModel

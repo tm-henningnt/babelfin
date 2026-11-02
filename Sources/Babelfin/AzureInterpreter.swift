@@ -112,7 +112,7 @@ enum WAVToPCM24 {
             let recognizer = try SPXTranslationRecognizer(speechTranslationConfiguration: settings,
                                                           autoDetectSourceLanguageConfiguration: detection, audioConfiguration: audioConfiguration)
             input.set(stream)
-            let (pieces, continuation) = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingNewest(64))
+            let (pieces, continuation) = AsyncStream<Data>.makeStream(bufferingPolicy: .unbounded)
             audio = continuation
             consumer = Task { [weak self] in
                 // Azure sends a whole passage at once, and English often runs longer than the source.
@@ -140,8 +140,14 @@ enum WAVToPCM24 {
                 let id = result.resultId
                 Task { @MainActor [weak self] in await self?.recognized(id: id, source: source, translated: translated, target: configuration.targetLanguage, token: token) }
             }
-            recognizer.addSynthesizingEventHandler { _, event in
+            recognizer.addSynthesizingEventHandler { [weak self] _, event in
                 guard let wav = event.result.audio, !wav.isEmpty, let pcm = try? WAVToPCM24.convert(wav) else { return }
+                // The consumer speeds up to catch up; past 30 s behind, the session reports the backlog
+                // instead of dropping passages without a word.
+                guard backlog.seconds < 30 else {
+                    Task { @MainActor [weak self] in await self?.fail("received_audio_backlog", token: token) }
+                    return
+                }
                 backlog.add(pcm.count)
                 continuation.yield(pcm)
             }

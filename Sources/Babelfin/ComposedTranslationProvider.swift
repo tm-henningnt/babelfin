@@ -218,7 +218,13 @@ private final class PreparedSpeech: @unchecked Sendable {
     private var configuration = TranslationConfiguration()
     private var credentials = ProviderCredentials()
     private var ledger = TranscriptRevisionLedger()
-    private struct Job { let segment: TranscriptSegment; let arrived: TimeInterval; let stamps = StageStamps() }
+    private struct Job {
+        let segment: TranscriptSegment; let arrived: TimeInterval; let stamps = StageStamps()
+        /// The translation's text as it streams in, so the first clause can be spoken early.
+        let progress = StreamingTranslation()
+        /// Started at commit when the translation stage has a free slot; otherwise when the job is taken.
+        var translation: Task<String, Error>?
+    }
     private var jobs: [Job] = []
     private var inFlight: Job?
     /// The synthesis prepared ahead for the segment being spoken, so Stop can cancel it.
@@ -330,6 +336,7 @@ private final class PreparedSpeech: @unchecked Sendable {
                 await reportSkipped(token: token)
                 queuedCharacters += segment.text.count
                 jobs.append(Job(segment: segment, arrived: now())); updateWaiting()
+                startTranslations()
                 if consumer == nil { consumer = Task { [weak self] in await self?.consume(token: token) } }
                 else { startLookahead() }
             } catch { await fail("recognition_segment_invalid", token: token) }
@@ -339,7 +346,8 @@ private final class PreparedSpeech: @unchecked Sendable {
     private func startLookahead() {
         guard speaking, lookahead == nil, !jobs.isEmpty else { return }
         let next = jobs.removeFirst()
-        let pending = translation(for: next), speech = PreparedSpeech()
+        let pending = next.translation ?? translation(for: next), speech = PreparedSpeech()
+        startTranslations()
         let request = configuration, keys = credentials, stamps = next.stamps, voice = request.voice(forSpeaker: next.segment.speaker)
         // Cancelling this task cancels the synthesis request, so a skipped segment frees its slot.
         let preparation = Task { @MainActor [synthesizer, gate, policy, now] in
@@ -357,16 +365,32 @@ private final class PreparedSpeech: @unchecked Sendable {
         lookahead = (next, pending, speech, preparation)
         updateWaiting()
     }
+    /// Translation requests that have started and not yet returned, cancelled ones included.
+    private var runningTranslations = 0
     private func translation(for job: Job) -> Task<String, Error> {
-        let source = job.segment, request = configuration, keys = credentials, stamps = job.stamps
-        return Task { @MainActor [translator, policy, now] in
+        let source = job.segment, request = configuration, keys = credentials, stamps = job.stamps, progress = job.progress
+        runningTranslations += 1
+        return Task { @MainActor [weak self, translator, policy, now] in
+            defer { self?.runningTranslations -= 1 }
             stamps.mark("translate", now())
-            let text = try await CompositionDeadline<String>().run(seconds: policy.stageTimeout) {
-                try await translator.translate(text: source.text, sourceLanguage: source.language ?? request.sourceLanguage,
-                                               targetLanguage: request.targetLanguage, credentials: keys)
-            }
-            stamps.mark("translated", now())
-            return text
+            do {
+                let text = try await CompositionDeadline<String>().run(seconds: policy.stageTimeout) {
+                    try await translator.translate(text: source.text, sourceLanguage: source.language ?? request.sourceLanguage,
+                                                   targetLanguage: request.targetLanguage, credentials: keys, into: progress)
+                }
+                stamps.mark("translated", now())
+                progress.finish()
+                return text
+            } catch { progress.fail(error); throw error }
+        }
+    }
+    /// Translates waiting jobs in queue order while the stage has a free slot. A job taken without a
+    /// translation starts one on demand, so up to two more can run; a stage with one slot works on demand only.
+    private func startTranslations() {
+        guard translator.maximumConcurrentRequests > 1 else { return }
+        var free = translator.maximumConcurrentRequests - runningTranslations
+        for index in jobs.indices where free > 0 && jobs[index].translation == nil {
+            jobs[index].translation = translation(for: jobs[index]); free -= 1
         }
     }
     private func consume(token: UUID) async {
@@ -381,7 +405,8 @@ private final class PreparedSpeech: @unchecked Sendable {
             else {
                 guard !jobs.isEmpty else { break }
                 job = jobs.removeFirst()
-                pending = translation(for: job); prepared = nil
+                pending = job.translation ?? translation(for: job); prepared = nil
+                startTranslations()
             }
             updateWaiting()
             inFlight = job
@@ -392,14 +417,21 @@ private final class PreparedSpeech: @unchecked Sendable {
             let delivered = DeliveredBytes()
             defer { activePreparation = nil }
             do {
-                let text = try await withTaskCancellationHandler { try await pending.value } onCancel: { pending.cancel() }
-                guard generation == token, !Task.isCancelled else { return }
-                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 80_000 else { throw BridgeError.invalidEvent }
-                let target = TranscriptSegment(id: source.id, revision: source.revision, text: text, isFinal: true,
-                    language: request.targetLanguage, startSeconds: source.startSeconds, endSeconds: source.endSeconds,
-                    speaker: source.speaker, timingReference: source.timingReference)
-                await onEvent?(.segment(target, role: .target))
-                guard generation == token, !Task.isCancelled else { return }
+                // A passage that starts from its translation, not from speech prepared ahead, speaks its first
+                // clause while the rest is still translated. The whole text goes to the transcript when it ends.
+                let streamed = prepared == nil && request.speaksTranslation && !gate.outputDetached
+                var head: String?
+                if streamed {
+                    let first = try await withTaskCancellationHandler { try await job.progress.head() } onCancel: { pending.cancel() }
+                    guard generation == token, !Task.isCancelled else { return }
+                    if !first.complete, !first.text.isEmpty { head = first.text }
+                }
+                var text = ""
+                if head == nil {
+                    text = try await withTaskCancellationHandler { try await pending.value } onCancel: { pending.cancel() }
+                    guard generation == token, !Task.isCancelled else { return }
+                    guard try await announce(text, for: source, request: request, token: token) else { return }
+                }
                 speaking = true
                 startLookahead()
                 defer { speaking = false }
@@ -430,30 +462,48 @@ private final class PreparedSpeech: @unchecked Sendable {
                     } else {
                         if synthesizer.prepareSpeakingRate(rate) { pace.native = rate }
                         stretcher.setRate(rate / pace.native)
-                        let deadline = CompositionDeadline<Void>()
-                        synthesisDeadline = deadline
-                        stamps.mark("voice", now())
-                        try await deadline.run(seconds: policy.stageTimeout) { [synthesizer, gate] in
-                            try await synthesizer.synthesize(text: text, language: request.targetLanguage, voiceID: request.voice(forSpeaker: source.speaker),
-                                                            credentials: keys, onAudio: { pcm in
-                                stamps.mark("voiced", now())
-                                adjust()
-                                let stretched = try stretcher.process(pcm)
-                                if !stretched.isEmpty { stamps.mark("played", now()); delivered.add(stretched.count); try await gate.deliver(stretched, generation: token) }
-                            })
+                        let voice = request.voice(forSpeaker: source.speaker)
+                        let speak: (String) async throws -> Void = { [self, synthesizer, gate, policy] part in
+                            let deadline = CompositionDeadline<Void>()
+                            synthesisDeadline = deadline
+                            stamps.mark("voice", now())
+                            try await deadline.run(seconds: policy.stageTimeout) {
+                                try await synthesizer.synthesize(text: part, language: request.targetLanguage, voiceID: voice,
+                                                                credentials: keys, onAudio: { pcm in
+                                    stamps.mark("voiced", now())
+                                    adjust()
+                                    let stretched = try stretcher.process(pcm)
+                                    if !stretched.isEmpty { stamps.mark("played", now()); delivered.add(stretched.count); try await gate.deliver(stretched, generation: token) }
+                                })
+                            }
+                            synthesisDeadline = nil
                         }
-                        synthesisDeadline = nil
+                        if let head {
+                            try await speak(head)
+                            // A failure here is the translation's, not the speech's.
+                            synthesizing = false
+                            text = try await withTaskCancellationHandler { try await pending.value } onCancel: { pending.cancel() }
+                            synthesizing = true
+                            guard generation == token, !Task.isCancelled else { return }
+                            guard try await announce(text, for: source, request: request, token: token) else { return }
+                            let tail = try await job.progress.tail()
+                            if !tail.isEmpty { try await speak(tail) }
+                        } else {
+                            try await speak(text)
+                        }
                     }
                     lastRate = pace.value
                     let rest = stretcher.finish()
                     if !rest.isEmpty { delivered.add(rest.count); try await gate.deliver(rest, generation: token) }
+                    let how: String
+                    if prepared != nil { how = ", prepared ahead" } else if head != nil { how = ", first clause early" } else { how = "" }
                     await onEvent?(.notice(String(format: "Segment timing: speech started %.1f s after commit, %.1f s of speech at %.2fx%@.",
-                                                  lag, Double(delivered.total) / 48_000, pace.value, prepared == nil ? "" : ", prepared ahead")))
+                                                  lag, Double(delivered.total) / 48_000, pace.value, how)))
                     if let played = stamps.value("played") {
                         let passage = source.startSeconds.flatMap { start in source.endSeconds.map { $0 - start } }.flatMap { $0 > 0 ? $0 : nil }
                         await onEvent?(.passage(PassageTiming(passageSeconds: passage, translateSeconds: stamps.span("translate", "translated"),
                             voiceSeconds: stamps.span("voice", "voiced"), preparedAhead: prepared != nil, totalSeconds: played - job.arrived,
-                            speechSeconds: Double(delivered.total) / 48_000, rate: pace.value)))
+                            speechSeconds: Double(delivered.total) / 48_000, rate: pace.value, handedOffAt: played)))
                     }
                 }
                 guard generation == token, !Task.isCancelled else { return }
@@ -489,6 +539,15 @@ private final class PreparedSpeech: @unchecked Sendable {
         }
         if generation == token { consumer = nil }
     }
+    /// Validates the whole translation and shows it in the transcript. False when the session changed.
+    private func announce(_ text: String, for source: TranscriptSegment, request: TranslationConfiguration, token: UUID) async throws -> Bool {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 80_000 else { throw BridgeError.invalidEvent }
+        let target = TranscriptSegment(id: source.id, revision: source.revision, text: text, isFinal: true,
+            language: request.targetLanguage, startSeconds: source.startSeconds, endSeconds: source.endSeconds,
+            speaker: source.speaker, timingReference: source.timingReference)
+        await onEvent?(.segment(target, role: .target))
+        return generation == token && !Task.isCancelled
+    }
     /// Drops waiting segments that are older than `maximumAge`, oldest first. The source
     /// transcript keeps their text; only their translation and speech are skipped.
     private func catchUp(token: UUID) async {
@@ -501,7 +560,7 @@ private final class PreparedSpeech: @unchecked Sendable {
         await reportSkipped(token: token)
     }
     private var skippedSegments = 0
-    private func skip(_ job: Job) { queuedCharacters -= job.segment.text.count; skippedSegments += 1 }
+    private func skip(_ job: Job) { job.translation?.cancel(); queuedCharacters -= job.segment.text.count; skippedSegments += 1 }
     private func reportSkipped(token: UUID) async {
         guard skippedSegments > 0, generation == token else { return }
         let count = skippedSegments; skippedSegments = 0
@@ -550,6 +609,7 @@ private final class PreparedSpeech: @unchecked Sendable {
         consumer?.cancel(); consumer = nil; monitor?.cancel(); monitor = nil
         lookahead?.translation.cancel(); lookahead?.preparation.cancel(); lookahead?.speech.finish(CancellationError()); lookahead = nil
         activePreparation?.task.cancel(); activePreparation?.speech.finish(CancellationError()); activePreparation = nil
+        jobs.forEach { $0.translation?.cancel() }
         jobs.removeAll(); inFlight = nil; queuedCharacters = 0; waiting.set(nil)
         credentials = ProviderCredentials(); state = .cancelled
     }

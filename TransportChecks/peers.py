@@ -61,7 +61,7 @@ for i, server in enumerate(servers):
     server.other_port = servers[1-i].server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
-    for provider, limit in [('openai',400000),('eleven',65536)]:
+    for provider, limit in [('openai',800000),('eleven',65536)]:
         for path, expected in [('/echo','echo'),(f'/oversize-{limit}','large'),('/redirect-same','refuse'),('/redirect-cross','refuse'),(f'/oversize-{limit+1}','refuse')]:
             before = sum(s.target_hits for s in servers)
             subprocess.run([sys.argv[1],provider,f'ws://127.0.0.1:{servers[0].server_address[1]}{path}',expected],check=True,timeout=6)

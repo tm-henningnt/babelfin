@@ -23,10 +23,11 @@ public enum SpeechToolsLimits {
 public enum SpeechToolsError: LocalizedError, Sendable, Equatable {
     case recordingTooLarge, invalidRecording, unsupportedFormat, invalidResponse
     case transcriptTooLarge, notesTooLarge, emptyText, clipTooLong, invalidPCM, unsupportedVoiceProvider
-    case dubUntimed, dubTooLong, revoiceTooLong
+    case dubUntimed, dubTooLong, revoiceTooLong, recordingTooLong
     public var errorDescription: String? {
         switch self {
         case .recordingTooLarge: return "Choose a recording up to 25 MB."
+        case .recordingTooLong: return "On this Mac transcribes recordings up to one hour. Choose a shorter recording."
         case .invalidRecording: return "The recording could not be read. Choose a local audio file."
         case .unsupportedFormat: return "Choose a WAV, MP3, M4A, MP4, FLAC, OGG, or WebM recording."
         case .invalidResponse: return "The service returned an incomplete or unsupported transcript."
@@ -177,13 +178,20 @@ public enum SpeechToolsWAV {
         guard !pcm.isEmpty, pcm.count.isMultiple(of: 2), pcm.count <= maximumBytes else {
             throw SpeechToolsError.invalidPCM
         }
-        var output = Data(); output.reserveCapacity(44 + pcm.count)
+        var output = header(dataBytes: pcm.count); output.reserveCapacity(44 + pcm.count)
+        output.append(pcm)
+        return output
+    }
+
+    /// The 44-byte header of a mono PCM16 WAV file with `dataBytes` of samples.
+    public static func header(dataBytes: Int, sampleRate: Int = 24_000) -> Data {
+        var output = Data(); output.reserveCapacity(44)
         func ascii(_ value: String) { output.append(contentsOf: value.utf8) }
         func u16(_ value: UInt16) { output.append(UInt8(value & 0xff)); output.append(UInt8(value >> 8)) }
         func u32(_ value: UInt32) { for shift in stride(from: 0, to: 32, by: 8) { output.append(UInt8((value >> shift) & 0xff)) } }
-        ascii("RIFF"); u32(UInt32(36 + pcm.count)); ascii("WAVEfmt "); u32(16)
-        u16(1); u16(1); u32(24_000); u32(48_000); u16(2); u16(16)
-        ascii("data"); u32(UInt32(pcm.count)); output.append(pcm)
+        ascii("RIFF"); u32(UInt32(36 + dataBytes)); ascii("WAVEfmt "); u32(16)
+        u16(1); u16(1); u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 2)); u16(2); u16(16)
+        ascii("data"); u32(UInt32(dataBytes))
         return output
     }
 }
@@ -193,7 +201,25 @@ public enum RecordingSource: Equatable, Sendable {
     case file(URL)
     /// A canonical 24 kHz mono WAV recorded in the app. It is never written to disk.
     case memory(wav: Data)
+    /// A meeting recording that Babelfin encoded to AAC (M4A) in its temporary folder.
+    case meeting(URL)
 
+    /// For a file source: the checked file, its extension and size, so the upload can stream it from
+    /// disk. Nil for a recording in memory. The checks are the same as for `upload`.
+    public func uploadFile() throws -> (url: URL, fileExtension: String, size: Int)? {
+        let url: URL, limit: Int
+        switch self {
+        case .memory: return nil
+        case .file(let file): url = file; limit = SpeechToolsLimits.recordingBytes
+        case .meeting(let file): url = file; limit = MeetingRecordingLimits.uploadBytes
+        }
+        guard url.isFileURL, let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+              values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size > 0 else {
+            throw SpeechToolsError.invalidRecording
+        }
+        guard size <= limit else { throw SpeechToolsError.recordingTooLarge }
+        return (url, url.pathExtension.lowercased(), size)
+    }
     /// The bytes to upload and their file extension. A file must be a regular, non-symbolic-link
     /// file within the size limit; `check` runs between reads so cancellation stops a large read.
     public func upload(check: () throws -> Void) throws -> (fileExtension: String, bytes: Data) {
@@ -203,18 +229,25 @@ public enum RecordingSource: Equatable, Sendable {
             guard wav.count <= SpeechToolsLimits.recordingBytes else { throw SpeechToolsError.recordingTooLarge }
             return ("wav", wav)
         case .file(let url):
+            return try Self.read(url, limit: SpeechToolsLimits.recordingBytes, check: check)
+        case .meeting(let url):
+            return try Self.read(url, limit: MeetingRecordingLimits.uploadBytes, check: check)
+        }
+    }
+    /// Reads a regular, non-symbolic-link file of at most `limit` bytes.
+    private static func read(_ url: URL, limit: Int, check: () throws -> Void) throws -> (fileExtension: String, bytes: Data) {
             guard url.isFileURL else { throw SpeechToolsError.invalidRecording }
             do {
                 let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
                 guard values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size > 0 else {
                     throw SpeechToolsError.invalidRecording
                 }
-                guard size <= SpeechToolsLimits.recordingBytes else { throw SpeechToolsError.recordingTooLarge }
+                guard size <= limit else { throw SpeechToolsError.recordingTooLarge }
                 var bytes = Data(); bytes.reserveCapacity(size)
                 let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
                 while let chunk = try handle.read(upToCount: 65_536), !chunk.isEmpty {
                     try check()
-                    guard chunk.count <= SpeechToolsLimits.recordingBytes - bytes.count else { throw SpeechToolsError.recordingTooLarge }
+                    guard chunk.count <= limit - bytes.count else { throw SpeechToolsError.recordingTooLarge }
                     bytes.append(chunk)
                 }
                 guard !bytes.isEmpty else { throw SpeechToolsError.invalidRecording }
@@ -222,6 +255,5 @@ public enum RecordingSource: Equatable, Sendable {
             } catch let safe as SpeechToolsError { throw safe }
             catch is CancellationError { throw CancellationError() }
             catch { throw SpeechToolsError.invalidRecording }
-        }
     }
 }

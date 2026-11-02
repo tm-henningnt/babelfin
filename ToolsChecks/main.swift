@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import BridgeCore
 
@@ -65,6 +66,7 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
             try parserChecks()
             try textAndWAVChecks()
             try await uploadChecks()
+            try meetingExportChecks()
             try await translationAndNotesChecks()
             try await voiceChecks()
             try await dubChecks()
@@ -127,6 +129,30 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
         print("PASS: WAV header, sample bytes, playback validation and bounds")
     }
 
+    static func meetingExportChecks() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let seconds = 25, rate = MeetingRecordingLimits.sampleRate
+        let tone = PCM16.encode((0..<(seconds * rate)).map { Float(sin(Double($0) * 0.06) * 0.25) })
+        let quiet = Data(count: tone.count / 2)
+        let microphone = directory.appendingPathComponent("microphone.pcm"), meeting = directory.appendingPathComponent("meeting.pcm")
+        try tone.write(to: microphone); try quiet.write(to: meeting)
+        let m4a = directory.appendingPathComponent("upload.m4a")
+        try MeetingAudioExport.m4a([microphone, meeting], to: m4a)
+        let encoded = try AVAudioFile(forReading: m4a)
+        let duration = Double(encoded.length) / encoded.fileFormat.sampleRate
+        let size = (try FileManager.default.attributesOfItem(atPath: m4a.path)[.size] as? Int) ?? 0
+        try expect(abs(duration - Double(seconds)) < 0.2 && size < seconds * 7_000, "M4A keeps the length at about 48 kbit/s: \(duration) s, \(size) bytes")
+        let wav = directory.appendingPathComponent("save.wav")
+        try MeetingAudioExport.wav([microphone, meeting], to: wav)
+        let saved = try Data(contentsOf: wav)
+        try expect(saved.count == tone.count + 44 && saved.prefix(44) == SpeechToolsWAV.header(dataBytes: tone.count), "WAV export header and length")
+        let activity = try MeetingAudioExport.activity(meeting)
+        try expect(activity.count == seconds && activity.allSatisfy { !$0 }, "Activity of a silent track")
+        print("PASS: meeting tracks mix into M4A and WAV in blocks")
+    }
+
     @MainActor static func uploadChecks() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -143,6 +169,14 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
         try expect(body.contains("name=\"use_speaker_library\"\r\n\r\nfalse") && body.contains("name=\"webhook\"\r\n\r\nfalse"), "No identity library or webhook")
         try expect(!body.contains("private-name") && !body.contains("synthetic-key") && body.contains("fixture-bytes"), "Generic multipart filename and credential separation")
         print("PASS: actual batch adapter multipart schema and credential isolation")
+        let glossaryHTTP = FakeHTTP([try fixture()])
+        let glossaryService = SpeechToolsService(transport: glossaryHTTP,
+            transcriber: ElevenLabsRecordingTranscriber(transport: glossaryHTTP, glossary: { ["Nesodden", "Aker brygge"] }))
+        _ = try await glossaryService.transcribe(fileURL: file, sourceLanguage: nil, credentials: .init(elevenLabs: "synthetic-key"))
+        let glossaryBody = String(data: glossaryHTTP.requests.get()[0].httpBody ?? Data(), encoding: .utf8) ?? ""
+        try expect(glossaryBody.contains("name=\"keyterms\"\r\n\r\nNesodden\r\n") && glossaryBody.contains("name=\"keyterms\"\r\n\r\nAker brygge\r\n"),
+                   "Glossary terms are sent as repeated keyterms fields")
+        print("PASS: the glossary reaches Scribe as keyterms")
         let recorded = try SpeechToolsWAV.encode(pcm: Data(repeating: 0, count: 4_800))
         let memoryHTTP = FakeHTTP([try fixture()])
         _ = try await SpeechToolsService(transport: memoryHTTP).transcribe(source: .memory(wav: recorded), credentials: .init(elevenLabs: "synthetic-key"))
@@ -274,6 +308,15 @@ final class FakeHTTP: ProviderHTTPTransport, @unchecked Sendable {
         catch let failure as CheckFailure { throw failure } catch { }
         try expect(unknownVoice.requests.get().isEmpty, "An unknown Gemini voice reached the network")
         print("PASS: Gemini voice clips send the chosen voice and refuse other audio formats")
+        let translateHTTP = FakeHTTP([try response("Hei, alle sammen.")])
+        let spoken = try await SpeechToolsService(transport: translateHTTP).translate(text: "Hello, everyone.", to: "no", credentials: .init(openAI: "synthetic-key"))
+        try expect(spoken == "Hei, alle sammen." && translateHTTP.requests.get().count == 1, "Read aloud translates the text once")
+        let keyless = FakeHTTP()
+        do { _ = try await SpeechToolsService(transport: keyless).translate(text: "Hello.", to: "no", credentials: .init(gemini: "synthetic-key"))
+             throw CheckFailure(message: "Translation without an OpenAI key was accepted") }
+        catch let failure as CheckFailure { throw failure } catch { }
+        try expect(keyless.requests.get().isEmpty, "Translation without a key reached the network")
+        print("PASS: read aloud translates once and needs an OpenAI key")
         let changerHTTP = FakeHTTP([pcm])
         let revoiced = try await SpeechToolsService(transport: changerHTTP).revoice(
             wav: try SpeechToolsWAV.encode(pcm: pcm), voiceID: "fixture", delivery: .steady, credentials: .init(elevenLabs: "synthetic-key"))

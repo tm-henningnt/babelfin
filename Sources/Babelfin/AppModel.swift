@@ -145,6 +145,9 @@ private final class CaptureAdmission: @unchecked Sendable {
     private let loadProviderCredentials: (@MainActor (TranslationRoute) throws -> ProviderCredentials)?
     private var segmentTexts: [String: (TranscriptRole, TranscriptSegment)] = [:]
     private var segmentOrder: [String] = []
+    /// Per role: the newest segment's key and the joined text before it, so a partial update of
+    /// the newest segment does not join all 500 segments again.
+    private var segmentTail: [TranscriptRole: (key: String, prefix: String)] = [:]
     private let providerFactory: @MainActor () -> any TranslationProvider
     private let audioFactory: @MainActor () -> any AudioPipelineControlling
     private let deviceList: @MainActor () -> [AudioDevice]
@@ -499,7 +502,7 @@ private final class CaptureAdmission: @unchecked Sendable {
         guard bypass || !capabilities.requiresVoiceID || !voiceID.isEmpty else { fail("Choose a voice in Settings first."); return }
         let configuration = AppSessionConfiguration(destination: destination, input: input, output: output, targetLanguage: targetLanguage, route: route, sourceLanguage: !route.descriptor.acceptsLanguageHint || sourceLanguage.isEmpty ? nil : sourceLanguage, voiceID: route.descriptor.isDirect || voiceID.isEmpty ? nil : voiceID, pacing: pacing, speaksTranslation: speakTranslation, originalAudio: bypass, originalMixEnabled: originalMixEnabled, originalMixLevel: originalMixLevel, originalMixDucking: originalMixDucking, speakerVoices: activeSpeakerVoices)
         sessionConfiguration = configuration
-        source = ""; translation = ""; segmentTexts = [:]; segmentOrder = []
+        source = ""; translation = ""; segmentTexts = [:]; segmentOrder = []; segmentTail = [:]
         transcriptLanguageName = configuration.targetLanguageName
         let token = UUID(); generation = token
         passageTimings = []
@@ -812,7 +815,15 @@ private final class CaptureAdmission: @unchecked Sendable {
             if segmentTexts[key] == nil { segmentOrder.append(key) }
             segmentTexts[key] = (role, segment)
             if segmentOrder.count > 500 { for key in segmentOrder.prefix(segmentOrder.count - 500) { segmentTexts[key] = nil }; segmentOrder = Array(segmentOrder.suffix(500)) }
-            let text = segmentOrder.compactMap { segmentTexts[$0] }.filter { $0.0 == role }.map { $0.1.text }.joined(separator: " ")
+            let text: String
+            if let tail = segmentTail[role], tail.key == key {
+                text = tail.prefix.isEmpty ? segment.text : tail.prefix + " " + segment.text
+            } else {
+                let keys = segmentOrder.filter { segmentTexts[$0]?.0 == role }
+                let texts = keys.compactMap { segmentTexts[$0]?.1.text }
+                text = texts.joined(separator: " ")
+                if let last = keys.last { segmentTail[role] = (last, texts.dropLast().joined(separator: " ")) }
+            }
             if role == .source { source = String(text.suffix(24_000)) } else { translation = String(text.suffix(24_000)) }
         case .audio(let pcm):
             guard phase == .running, !bypass else { return }
@@ -835,7 +846,16 @@ private final class CaptureAdmission: @unchecked Sendable {
                 if !recovered { fail(detail) }
             }
         case .notice(let detail): log(detail)
-        case .passage(let timing): passageTimings = Array((passageTimings + [timing]).suffix(20))
+        case .passage(var timing):
+            if let handedOff = timing.handedOffAt, let audible = audio?.audibleStart(after: handedOff - 0.001) {
+                timing.playbackSeconds = max(0, audible - handedOff)
+            }
+            if let audible = timing.audibleSeconds {
+                log(String(format: "Passage timing: audible %.2f s after commit (hand-off %.2f s, playback start %.2f s; translation %.2f s, voice %.2f s%@).",
+                           audible, timing.totalSeconds, timing.playbackSeconds ?? 0, timing.translateSeconds ?? -1, timing.voiceSeconds ?? -1,
+                           timing.preparedAhead ? ", prepared ahead" : ""))
+            }
+            passageTimings = Array((passageTimings + [timing]).suffix(20))
         default: break
         }
     }
@@ -848,7 +868,7 @@ private final class CaptureAdmission: @unchecked Sendable {
     }
     private static func retryable(_ code: String) -> Bool {
         ["translation_disconnected", "audio_send_failed", "audio_upload_stale", "unexpected_session_close", "session_expired", "recognition_transport", "text_translation_failed_transient", "speech_synthesis_failed_transient",
-         "received_audio_stale", "received_audio_backlog", "audio_burst_exceeds_five_seconds"].contains(code)
+         "received_audio_stale", "received_audio_backlog", "audio_burst_too_long"].contains(code)
     }
     private func recoverOriginalAfterTranslationFailure(_ detail: String, retry: Bool = false) async -> Bool {
         guard !muted, !bypass, phase == .running, audio != nil, !requiresDeviceResume else { return false }
@@ -919,15 +939,15 @@ private final class CaptureAdmission: @unchecked Sendable {
             guard !Task.isCancelled, failureRecoveryToken == operation, active, bypass, !muted,
                   !requiresDeviceResume, !requiresConsumerResume else { candidate.cancel(); return }
             guard nowForControl() < expiresAt else { throw BridgeError.timedOut }
-            var startupFailure = false
+            let startup = StartupFailureFlag()
             candidate.onEvent = { event in
-                if case .failure = event { startupFailure = true }
-                if case .closed = event { startupFailure = true }
+                if case .failure = event { startup.set() }
+                if case .closed = event { startup.set() }
             }
             try await candidate.start(configuration: currentTranslationConfiguration(), credentials: credentials)
             guard !Task.isCancelled, failureRecoveryToken == operation, !muted, !requiresDeviceResume, !requiresConsumerResume, active, bypass else { candidate.cancel(); return }
             guard nowForControl() < expiresAt else { throw BridgeError.timedOut }
-            guard !startupFailure else { throw ProviderNetworkError.transport }
+            guard !startup.failed else { throw ProviderNetworkError.transport }
             let token = UUID()
             let meter = beginUsage(route)
             let admission = CaptureAdmission({ pcm in try candidate.append(pcm); meter.countSent(pcm.count) }, failure: { [weak self] in
@@ -970,7 +990,7 @@ private final class CaptureAdmission: @unchecked Sendable {
         switch code {
         case "audio_playback_failed":
             return "Playback stopped. Check the selected output, refresh devices, and start again."
-        case "received_audio_stale", "received_audio_backlog", "audio_burst_exceeds_five_seconds":
+        case "received_audio_stale", "received_audio_backlog", "audio_burst_too_long":
             return "Translated audio fell behind, so Babelfin discarded it. Check the network if this repeats."
         case "audio_upload_stale", "audio_send_failed":
             return "Audio upload stopped. Check the network and source, then start again."
@@ -984,8 +1004,6 @@ private final class CaptureAdmission: @unchecked Sendable {
             return "Translation fell behind. Pause, then start again with shorter phrases."
         case "recognition_failed", "recognition_closed", "recognition_segment_invalid", "recognition_transport":
             return "Speech recognition stopped. Check service access and your network, then start again."
-        case "translation_stage_failed":
-            return "Translation or voice playback could not finish. Check the selected voice, service access and network."
         case "text_translation_failed", "text_translation_failed_transient":
             return "Text translation stopped. Check OpenAI access and the session details in Settings."
         case "speech_synthesis_failed", "speech_synthesis_failed_transient":
@@ -1032,7 +1050,7 @@ private final class CaptureAdmission: @unchecked Sendable {
             log("API connection check failed. Check the key notice in Settings.")
         }
     }
-    func clearTranscript() { source = ""; translation = ""; segmentTexts = [:]; segmentOrder = [] }
+    func clearTranscript() { source = ""; translation = ""; segmentTexts = [:]; segmentOrder = []; segmentTail = [:] }
     func clearDiagnostics() { logs = [] }
     func clearSessionText() { clearTranscript(); clearDiagnostics() }
     private func log(_ detail: String) {
@@ -1103,3 +1121,10 @@ extension AppModel {
 extension Notification.Name {
     static let babelfinCredentialMetadataChanged = Notification.Name("babelfin.credentials.metadata.changed")
 }
+
+/// Set by a provider event during a reconnect start; read on the main actor after the start returns.
+@MainActor private final class StartupFailureFlag {
+    private(set) var failed = false
+    func set() { failed = true }
+}
+

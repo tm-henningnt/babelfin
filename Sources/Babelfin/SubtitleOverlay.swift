@@ -92,7 +92,8 @@ enum SubtitleLines {
     static func latest(_ transcript: MeetingTranscript, source: SubtitleSource, limit: Int) -> [SubtitleLine] {
         var lines: [SubtitleLine] = []
         var originals: [ConversationDirection: String] = [:]
-        for entry in transcript.entries where source.includes(entry.direction) {
+        // Only the newest entries can produce the last lines; a long meeting holds up to 50 000.
+        for entry in transcript.entries.suffix(max(60, limit * 12)) where source.includes(entry.direction) {
             let text = entry.segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
             if entry.role == .target {
@@ -120,7 +121,7 @@ struct SubtitleContent: View {
     /// The overlay fills its window; the preview sizes to its text.
     var fillsHeight = true
     @AppStorage(SubtitlePreferences.style) private var style: SubtitleStyle = .captions
-    @AppStorage(SubtitlePreferences.source) private var source: SubtitleSource = .meeting
+    @AppStorage(SubtitlePreferences.source) private var source: SubtitleSource = .both
     @AppStorage(SubtitlePreferences.textSize) private var textSize = 26.0
     @AppStorage(SubtitlePreferences.text) private var text: SubtitleText = .translation
     @AppStorage(SubtitlePreferences.font) private var font: SubtitleFont = .system
@@ -235,14 +236,14 @@ private struct TextEdge: ViewModifier {
 struct SubtitleView: View {
     @ObservedObject var conversation: ConversationModel
     @AppStorage(SubtitlePreferences.style) private var style: SubtitleStyle = .captions
-    @AppStorage(SubtitlePreferences.source) private var source: SubtitleSource = .meeting
+    @AppStorage(SubtitlePreferences.source) private var source: SubtitleSource = .both
     @AppStorage(SubtitlePreferences.textSize) private var textSize = 26.0
     @StateObject private var hover = SubtitleHover()
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             SubtitleContent(lines: SubtitleLines.latest(conversation.transcript, source: source, limit: style == .captions ? 4 : 200),
-                            placeholder: conversation.active ? "Waiting for translated speech…" : "Start a direction to see subtitles.")
+                            placeholder: placeholder)
             if hover.inside { options.transition(.opacity) }
         }
         .onHover { inside in withAnimation(.easeOut(duration: 0.15)) { hover.inside = inside } }
@@ -250,6 +251,16 @@ struct SubtitleView: View {
         .accessibilityLabel("Subtitles")
     }
 
+    /// Says which direction the subtitles follow, so an empty overlay is never a mystery.
+    private var placeholder: String {
+        let followed = [conversation.outgoing, conversation.incoming].enumerated().filter { index, _ in
+            source.includes(index == 0 ? .outgoing : .incoming) }.map(\.element)
+        if followed.contains(where: \.active) { return "Waiting for translated speech…" }
+        if conversation.active {
+            return "Subtitles follow \(source.title). Choose Both directions in the options to see the other one."
+        }
+        return "Start Translate in Speak or Listen to see subtitles."
+    }
     private var options: some View {
         Menu {
             Picker("Layout", selection: $style) { ForEach(SubtitleStyle.allCases) { Text($0.title).tag($0) } }
@@ -281,7 +292,7 @@ struct SubtitleSettingsButton: View {
 struct SubtitleSettingsSection: View {
     @ObservedObject private var overlay = SubtitleOverlay.shared
     @AppStorage(SubtitlePreferences.style) private var style: SubtitleStyle = .captions
-    @AppStorage(SubtitlePreferences.source) private var source: SubtitleSource = .meeting
+    @AppStorage(SubtitlePreferences.source) private var source: SubtitleSource = .both
     @AppStorage(SubtitlePreferences.textSize) private var textSize = 26.0
     @AppStorage(SubtitlePreferences.text) private var text: SubtitleText = .translation
     @AppStorage(SubtitlePreferences.font) private var font: SubtitleFont = .system
@@ -298,7 +309,7 @@ struct SubtitleSettingsSection: View {
 
     var body: some View {
         Section {
-            Toggle("Show subtitles", isOn: Binding(get: { overlay.visible }, set: { if $0 != overlay.visible { overlay.toggle() } }))
+            Toggle("Show subtitles", isOn: Binding(get: { overlay.visible }, set: { if $0 != overlay.visible { overlay.toggle() } })).accessibilityLabel("Show subtitles")
             preview
             Picker("Layout", selection: $style) { ForEach(SubtitleStyle.allCases) { Text($0.title).tag($0) } }
                 .pickerStyle(.segmented)
@@ -307,7 +318,7 @@ struct SubtitleSettingsSection: View {
             }
             Picker("Show", selection: $source) { ForEach(SubtitleSource.allCases) { Text($0.title).tag($0) } }
             Picker("Text", selection: $text) { ForEach(SubtitleText.allCases) { Text($0.title).tag($0) } }
-            Toggle("Speaker names", isOn: $speakers)
+            Toggle("Speaker names", isOn: $speakers).accessibilityLabel("Speaker names")
         } header: { Text("Subtitles") }
         Section {
             Picker("Font", selection: $font) { ForEach(SubtitleFont.allCases) { Text($0.title).tag($0) } }
@@ -333,7 +344,7 @@ struct SubtitleSettingsSection: View {
                     Text(opacity, format: .percent.precision(.fractionLength(0))).monospacedDigit().frame(width: 48, alignment: .trailing)
                 }
             }
-            Toggle("Outline", isOn: $outline)
+            Toggle("Outline", isOn: $outline).accessibilityLabel("Outline")
             if outline {
                 LabeledContent("Outline width") {
                     HStack {
@@ -342,8 +353,8 @@ struct SubtitleSettingsSection: View {
                     }
                 }
             }
-            Toggle("Shadow", isOn: $shadow)
-            Toggle("Click through", isOn: $clickThrough)
+            Toggle("Shadow", isOn: $shadow).accessibilityLabel("Shadow")
+            Toggle("Click through", isOn: $clickThrough).accessibilityLabel("Click through")
                 .help("Clicks pass through the subtitles to the window below. Turn this off to move or resize them.")
             Button("Restore Defaults", action: restoreDefaults)
         } header: { Text("Subtitle appearance") }
@@ -367,7 +378,7 @@ struct SubtitleSettingsSection: View {
     }
 
     private func restoreDefaults() {
-        style = .captions; source = .meeting; textSize = 26; text = .translation; font = .system; weight = .semibold
+        style = .captions; source = .both; textSize = 26; text = .translation; font = .system; weight = .semibold
         color = .white; opacity = 0.72; outline = false; outlineWidth = 2; shadow = true
         captionLines = 2; centered = true; speakers = true; clickThrough = false
     }

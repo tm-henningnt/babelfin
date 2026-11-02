@@ -179,7 +179,7 @@ private struct SpeakerVoicesRows: View {
     }
     var body: some View {
         if model.route.descriptor.liveSpeakerLabels {
-            Toggle("Voice per speaker", isOn: enabled).disabled(model.configurationLocked)
+            Toggle("Voice per speaker", isOn: enabled).disabled(model.configurationLocked).accessibilityLabel("Voice per speaker")
             if !model.speakerVoices.isEmpty {
                 ForEach(model.speakerVoices.indices, id: \.self) { index in
                     HStack(spacing: 8) {
@@ -376,7 +376,7 @@ private struct VoiceCreationSheet: View {
                     TextField("Voice name", text: $state.name).textFieldStyle(.roundedBorder).labelsHidden()
                 }
             }
-            Toggle("I own this voice or have permission to clone it", isOn: $state.consent).toggleStyle(.checkbox)
+            Toggle("I own this voice or have permission to clone it", isOn: $state.consent).toggleStyle(.checkbox).accessibilityLabel("I own this voice or have permission to clone it")
                 .disabled(recorder.recording || state.busy)
             if state.busy {
                 HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Creating voice…").foregroundStyle(.secondary) }

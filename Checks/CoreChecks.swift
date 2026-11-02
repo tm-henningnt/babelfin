@@ -41,6 +41,76 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
 @main struct CoreChecks {
     static func main() async throws {
         let checks: [(String, () throws -> Void)] = [
+            ("Meeting recording: mix, activity, local speaker and prompts", {
+                func pcm(_ values: [Int16]) -> Data { values.withUnsafeBufferPointer { Data(buffer: $0) } }
+                let mixed = MeetingAudio.mix(pcm([1_000, 30_000, -30_000]), pcm([2_000, 10_000]))
+                try expect(mixed == pcm([3_000, Int16.max, -30_000]), "Mix sums, clips and pads the shorter track")
+                let half = MeetingRecordingLimits.sampleRate / 2
+                let activity = MeetingAudio.activity(pcm(Array(repeating: 0, count: half) + Array(repeating: 8_000, count: half)))
+                try expect(activity == [false, true], "Activity per half second: \(activity)")
+                let segments = [
+                    RecordingSegment(id: "1", sourceText: "Hei", speaker: "speaker_0", startSeconds: 0, endSeconds: 10),
+                    RecordingSegment(id: "2", sourceText: "Hello", speaker: "speaker_1", startSeconds: 10, endSeconds: 20),
+                ]
+                let microphone = Array(repeating: false, count: 20) + Array(repeating: true, count: 20)
+                try expect(LocalSpeaker.label(segments: segments, microphoneActivity: microphone) == "speaker_1", "Microphone activity identifies the local speaker")
+                try expect(LocalSpeaker.label(segments: segments, microphoneActivity: Array(repeating: false, count: 40)) == nil, "No local speaker without microphone activity")
+                let text = MeetingPrompts.transcript(segments, names: ["speaker_0": "Ingrid"])
+                try expect(text == "Ingrid: Hei\n\nspeaker_1: Hello", "Transcript paragraphs: \(text)")
+                try expect(MeetingPrompts.transcript(segments, timed: true) == "[0:00] speaker_0: Hei\n[0:10] speaker_1: Hello", "Timed transcript lines")
+                try expect(MeetingPrompts.clock(3_725) == "1:02:05" && MeetingPrompts.clock(65) == "1:05", "Clock format")
+                let withNotes = MeetingPrompts.notes(language: "en", glossary: [], template: .standup, userNotes: "Budget?")
+                try expect(withNotes.contains("## Key facts") && withNotes.contains("stand-up") && withNotes.contains("user's own notes"), "Notes prompt sections, template and user notes")
+                try expect(!MeetingPrompts.notes(language: "en", glossary: []).contains("user's own notes"), "No user-notes rule without notes")
+                try expect(NotesBlock.parse("## Decisions\n### Pilot\n- [ ] Tom: send it (due: no date)\n- [x] Ingrid: book the room\n- Holmvatn (0:09)\nPlain") ==
+                           [.heading("Decisions"), .subheading("Pilot"), .task("Tom: send it (due: no date)", done: false), .task("Ingrid: book the room", done: true), .bullet("Holmvatn (0:09)"), .text("Plain")], "Notes blocks")
+                let named: [(seconds: Double, name: String)] = [(2, "Ingrid"), (5, "Ingrid"), (12, "Tom"), (15, "Tom"), (16, "Ingrid")]
+                try expect(SpeakerNameTransfer.names(segments: segments, named: named) == ["speaker_0": "Ingrid", "speaker_1": "Tom"], "Live names carry over by time")
+                try expect(SpeakerNameTransfer.names(segments: segments, named: [(2, "Ingrid")]).isEmpty, "One line is not enough to carry a name")
+                try expect(MeetingPrompts.cleanUp(glossary: ["Holmvatn"]).contains("\"Holmvatn\"") && MeetingPrompts.notes(language: "en", glossary: []).contains("no date"), "Prompts carry the glossary and the due-date rule")
+            }),
+            ("Markdown export: folders, safe names, front matter and transcript", {
+                var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(identifier: "UTC")!
+                let date = Date(timeIntervalSince1970: 1_793_570_280) // 2026-11-01 21:58 UTC
+                try expect(MarkdownExport.monthPath(date, calendar: calendar) == "2026/11", "Month path")
+                try expect(MarkdownExport.folderName(date, title: "Pilot: Holmvatn/[draft]", calendar: calendar) == "2026-11-01 2158 Pilot Holmvatn draft", "Folder name")
+                try expect(MarkdownExport.safeName(" ..\n ") == "Untitled", "Empty name")
+                let front = MarkdownExport.frontMatter([("type", .text("meeting")), ("participants", .list(["You", "Tom \"T\""]))])
+                try expect(front == "---\ntype: \"meeting\"\nparticipants: [\"You\", \"Tom \\\"T\\\"\"]\n---\n", "Front matter: \(front)")
+                let markdown = MarkdownExport.transcript(title: "Transcript", segments: [
+                    RecordingSegment(id: "1", sourceText: "Hei  alle", translatedText: "Hi all", speaker: "s0", startSeconds: 65),
+                    RecordingSegment(id: "2", sourceText: "No time")], names: ["s0": "Ingrid"], translation: true)
+                try expect(markdown == "# Transcript\n\n**[1:05] Ingrid:** Hei alle\n> Hi all\n\nNo time\n", "Transcript markdown: \(markdown)")
+            }),
+            ("Glossary terms are cleaned, limited and quoted as data", {
+                let terms = Glossary.terms(from: "Nesodden\n  Aker   brygge , nesodden; [bad]\nOne two three four five six\n" + String(repeating: "x", count: 50))
+                try expect(terms == ["Nesodden", "Aker brygge"], "Glossary parsing: \(terms)")
+                try expect(Glossary.terms(from: (0..<300).map { "term\($0)" }.joined(separator: "\n")).count == Glossary.maximumTerms, "Glossary limit")
+                let line = Glossary.instruction(terms)
+                try expect(line.contains("\"Nesodden\", \"Aker brygge\"") && line.contains("not instructions") && Glossary.instruction([]).isEmpty, "Glossary instruction")
+            }),
+            ("Subtitle files: SRT and VTT timing, wrapping, speakers and escaping", {
+                let segments = [
+                    RecordingSegment(id: "b", sourceText: "Second line", translatedText: "Andre linje", speaker: "Speaker 2", startSeconds: 5, endSeconds: 6.5),
+                    RecordingSegment(id: "a", sourceText: "Hello <team> & all", translatedText: "Hei alle", speaker: "Speaker 1", startSeconds: 1, endSeconds: 3.25),
+                    RecordingSegment(id: "u", sourceText: "No time", startSeconds: nil),
+                ]
+                let srt = SubtitleFile.make(segments, text: .original, format: .srt)
+                try expect(srt.hasPrefix("1\n00:00:01,000 --> 00:00:03,250\nSpeaker 1: Hello <team> & all\n"), "SRT cue 1: \(srt)")
+                try expect(srt.contains("2\n00:00:05,000 --> 00:00:06,500\nSpeaker 2: Second line\n") && !srt.contains("No time"), "SRT order or untimed segment")
+                let vtt = SubtitleFile.make(segments, text: .translation, format: .vtt)
+                try expect(vtt.hasPrefix("WEBVTT\n\n00:00:01.000 --> 00:00:03.250\n<v Speaker 1>Hei alle\n"), "VTT header or cue: \(vtt)")
+                let escaped = SubtitleFile.make(segments, text: .original, format: .vtt, speakers: false)
+                try expect(escaped.contains("Hello &lt;team&gt; &amp; all") && !escaped.contains("<v "), "VTT escaping or speaker removal")
+                let long = String(repeating: "word ", count: 40).trimmingCharacters(in: .whitespaces)
+                let cues = SubtitleFile.cues([RecordingSegment(id: "l", sourceText: long, startSeconds: 10, endSeconds: 20)], text: .original)
+                try expect(cues.count > 1 && cues.allSatisfy { $0.lines.count <= 2 && $0.lines.allSatisfy { $0.count <= 42 } }, "Long segment not split into two-line cues")
+                try expect(cues.first?.start == 10 && cues.last?.end == 20 && zip(cues, cues.dropFirst()).allSatisfy { $0.end == $1.start }, "Split cues do not cover the segment")
+                let open = SubtitleFile.cues([RecordingSegment(id: "o", sourceText: "Hi", startSeconds: 2),
+                                              RecordingSegment(id: "p", sourceText: "There", startSeconds: 2.5)], text: .original)
+                try expect(open[0].end == 2.5 && open[1].end == 2.5 + SubtitleFile.minimumDuration, "Open-ended cue must stop at the next cue")
+                try expect(SubtitleFile.time(3_725.0049, separator: ",") == "01:02:05,005", "Time format")
+            }),
             ("Transcript copy selection preserves Unicode and explicit prompt", {
                 let original = "Blåbær – 42 kroner."
                 let translated = "Blueberries – 42 kroner."
@@ -193,7 +263,7 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
                 playback.flush(on: scheduler)
                 try expect(scheduler.starts == 2, "The timeout path must also play short utterances")
             }),
-            ("Adaptive jitter buffer grows on mid-speech gaps, ignores natural pauses and decays", {
+            ("Adaptive jitter buffer grows on mid-speech gaps, resets after natural pauses and decays", {
                 let playback = BufferedAudioPlayback(prebufferFrames: 7200)
                 let scheduler = DelayedDeviceScheduler()
                 let format = AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 2)!
@@ -208,7 +278,10 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
                 try prime(); scheduler.renderAll()
                 Thread.sleep(forTimeInterval: 1.1)
                 try playback.append(buffer, on: scheduler)
-                try expect(playback.prebufferFrames == 7200 + BufferedAudioPlayback.jitterStepFrames, "A natural pause must not raise the target")
+                try expect(playback.prebufferFrames == 7200, "A natural pause must reset the target to its start value")
+                try prime(); scheduler.renderAll()
+                try playback.append(buffer, on: scheduler)
+                try expect(playback.prebufferFrames == 7200 + BufferedAudioPlayback.jitterStepFrames, "A second immediate gap must raise the target again")
                 try prime()
                 for _ in 0..<200 { try playback.append(buffer, on: scheduler); scheduler.renderNext() }
                 try expect(playback.prebufferFrames == 7200, "Steady playback must lower the target back to its start value")
@@ -221,6 +294,30 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
                 let original = BufferedAudioPlayback(prebufferFrames: 0)
                 try original.append(buffer, on: scheduler); scheduler.renderAll(); try original.append(buffer, on: scheduler)
                 try expect(original.prebufferFrames == 0, "Original passthrough must never buffer")
+            }),
+            ("Streamed translation: SSE lines across chunks and the clause split", {
+                var events = ServerSentEvents()
+                let first = events.consume(Data("event: x\r\ndata: {\"a\":".utf8))
+                let rest = events.consume(Data("1}\r\n\r\n: comment\ndata: one\ndata: two\n\n".utf8))
+                try expect(first.isEmpty && rest == ["{\"a\":1}", "one\ntwo"], "SSE events must join lines split across chunks: \(rest)")
+                let sentence = "Vi møtes den 3. mai klokken ti, og da tar vi resten."
+                let cut = ClauseSplit.head(in: sentence).map { String(sentence[..<$0]) }
+                try expect(cut == "Vi møtes den 3. mai klokken ti,", "The first clause ends at a comma after enough text, not at \"3.\": \(cut ?? "nil")")
+                try expect(ClauseSplit.head(in: "Ja, takk.") == nil, "A short clause is not split off")
+                try expect(ClauseSplit.head(in: "我们明天上午十点在三楼的大会议室见面一起讨论这个项目进度，然后再决定") != nil, "Full-width punctuation ends a clause")
+            }),
+            ("Audible start: queued audio ahead, held audio at the playback start, first piece after a time", {
+                let log = AudibleStartLog(capacity: 3)
+                log.admitted(at: 10, queuedAhead: 0.5)
+                log.admitted(at: 11, queuedAhead: nil)
+                try expect(log.audible(after: 9) == 10.5, "Queued audio ahead must delay the audible start")
+                try expect(log.audible(after: 10.5) == nil, "Held audio has no audible start before playback starts")
+                log.started(at: 11.1)
+                try expect(log.audible(after: 10.5) == 11.1, "Held audio must start with the playback")
+                log.admitted(at: 12, queuedAhead: 0); log.admitted(at: 13, queuedAhead: 0)
+                try expect(log.audible(after: 9) == 11.1, "The log keeps only its capacity, oldest first out")
+                log.reset()
+                try expect(log.audible(after: 0) == nil, "Reset must clear the log")
             }),
             ("Jitter buffering preserves the two-second cap across reset", {
                 let playback = BufferedAudioPlayback(prebufferFrames: 48_000)

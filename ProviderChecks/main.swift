@@ -190,14 +190,14 @@ final class FakeSocket: TranslationWebSocket, @unchecked Sendable {
                 try require(socket.isCancelled, "Control overflow left transport active")
                 gate.release()
             }),
-            ("A single audio burst exceeding five seconds fails clearly", {
+            ("A single audio burst over ten seconds fails clearly", {
                 let socket = FakeSocket(), provider = OpenAITranslationProvider(transportFactory: { _ in socket })
                 let events = Events()
                 provider.onEvent = { events.accept($0) }
                 provider.onAudio = { pcm in await events.accept(.audio(pcm)) }
                 try await provider.start(configuration: .init(), apiKey: "fixture")
-                socket.audio(seconds: 5.1)
-                try await eventually("Oversized burst not surfaced") { events.failures.contains("audio_burst_exceeds_five_seconds") }
+                socket.audio(seconds: 10.1)
+                try await eventually("Oversized burst not surfaced") { events.failures.contains("audio_burst_too_long") }
                 try require(events.audio.isEmpty, "Oversized burst partly admitted")
             }),
             ("Sustained overproduction fails explicitly", {
@@ -209,9 +209,9 @@ final class FakeSocket: TranslationWebSocket, @unchecked Sendable {
                     await events.accept(.audio(pcm))
                 }
                 try await provider.start(configuration: .init(), apiKey: "fixture")
-                socket.audio(seconds: 2.4)
+                socket.audio(seconds: 4.8)
                 try await eventually("Missing in-flight packet") { gate.entered }
-                socket.audio(seconds: 2.4); socket.audio(seconds: 0.3)
+                socket.audio(seconds: 4.8); socket.audio(seconds: 0.6)
                 try await eventually("Overflow not surfaced") { events.failures.contains("received_audio_backlog") }
                 try require(socket.isCancelled, "Overflow left socket active")
                 gate.release()

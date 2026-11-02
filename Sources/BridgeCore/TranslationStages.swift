@@ -104,6 +104,22 @@ public extension StreamingSpeechRecognizer {
 @MainActor public protocol TextTranslationStage: AnyObject, Sendable {
     func translate(text: String, sourceLanguage: String?, targetLanguage: String, credentials: ProviderCredentials) async throws -> String
     func cancel()
+    /// Requests the stage runs at once. Above one, waiting passages are translated as they arrive.
+    var maximumConcurrentRequests: Int { get }
+    /// Translates and appends the text to `progress` as it arrives; returns the whole translation.
+    func translate(text: String, sourceLanguage: String?, targetLanguage: String, credentials: ProviderCredentials,
+                   into progress: StreamingTranslation) async throws -> String
+}
+extension TextTranslationStage {
+    public var maximumConcurrentRequests: Int { 1 }
+    /// Translates and appends the text to `progress` as it arrives; returns the whole translation.
+    /// A stage that cannot stream appends the whole translation at once.
+    public func translate(text: String, sourceLanguage: String?, targetLanguage: String, credentials: ProviderCredentials,
+                          into progress: StreamingTranslation) async throws -> String {
+        let translated = try await translate(text: text, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage, credentials: credentials)
+        progress.append(translated)
+        return translated
+    }
 }
 @MainActor public protocol SpeechSynthesisStage: AnyObject, Sendable {
     /// Output is ordered mono24kHz PCM16; await the sink for backpressure and honor cancellation.

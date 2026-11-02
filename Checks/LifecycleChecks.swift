@@ -473,7 +473,7 @@ private final class InventoryFixture: @unchecked Sendable {
                 try require((try? JSONDecoder().decode([TranslationRoute].self, from: Data("[\"unknown\"]".utf8))) == nil, "Unknown route must not decode")
             }),
             ("Late translated audio returns to original and reconnects; only a playback failure stops", {
-                for code in ["received_audio_stale", "received_audio_backlog", "audio_burst_exceeds_five_seconds"] {
+                for code in ["received_audio_stale", "received_audio_backlog", "audio_burst_too_long"] {
                     let trace = Trace(), catalog = DeviceCatalog(), clock = TextClock(), audio = FakeAudio(trace)
                     let first = FakeProvider(trace), second = FakeProvider(trace)
                     let app = recoveryModel([first, second], audio, catalog: catalog, clock: clock)

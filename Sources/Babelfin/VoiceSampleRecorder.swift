@@ -115,12 +115,14 @@ import BridgeCore
 
 /// `copy` runs on the device's IO thread and only copies the samples. Conversion runs on a
 /// serial queue, so `conversion` and `onConverted` are used from one thread at a time.
-private final class RecorderSink: @unchecked Sendable {
+final class RecorderSink: @unchecked Sendable {
     private let format: AVAudioFormat
     private let conversion: CaptureConversion
     private let queue = DispatchQueue(label: "no.tallmaker.Babelfin.recorder")
     var onConverted: (([Data], Float) -> Void)?
     init(format: AVAudioFormat, conversion: CaptureConversion) { self.format = format; self.conversion = conversion }
+    /// After the capture has stopped: waits for queued conversions and returns the converter's last samples.
+    func drain() -> [Data] { queue.sync { (try? conversion.finish()) ?? [] } }
     func copy(frames: AVAudioFrameCount, buffers: UnsafePointer<AudioBufferList>) {
         guard frames > 0, let bytes = buffers.pointee.mBuffers.mData else { return }
         let samples = Data(bytes: bytes, count: Int(buffers.pointee.mBuffers.mDataByteSize))
@@ -129,9 +131,10 @@ private final class RecorderSink: @unchecked Sendable {
     private func convert(_ samples: Data, frames: AVAudioFrameCount) {
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
               let destination = buffer.mutableAudioBufferList.pointee.mBuffers.mData else { return }
+        // A new buffer reports zero bytes until its frame length is set.
+        buffer.frameLength = frames
         let capacity = Int(buffer.mutableAudioBufferList.pointee.mBuffers.mDataByteSize)
         samples.withUnsafeBytes { _ = memcpy(destination, $0.baseAddress!, min(capacity, $0.count)) }
-        buffer.frameLength = frames
         guard let (chunks, level) = try? conversion.convert(buffer) else { return }
         onConverted?(chunks, level)
     }

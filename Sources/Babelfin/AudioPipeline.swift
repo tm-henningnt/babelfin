@@ -62,6 +62,7 @@ import BridgeCore
         try await capture?.finish()
     }
     func metricsSummary() -> String { worker.metricsSummary() }
+    func audibleStart(after time: TimeInterval) -> TimeInterval? { worker.audibleStarts.audible(after: time) }
     #if BABELFIN_AUDIO_TRACE
     func audioTraceAfterStop() -> AudioMixerTrace? { worker.audioTraceAfterStop() }
     #endif
@@ -79,7 +80,6 @@ struct CaptureDeliveryFixture: Sendable {
 private final class AudioWorker: @unchecked Sendable {
     private let control = DispatchQueue(label: "Babelfin.audio-control", qos: .userInitiated)
     private let playback = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
     private var renderMixer: RenderAudioMixer?
     private var renderSource: AVAudioSourceNode?
     private var completionWatch: DispatchSourceTimer?
@@ -87,10 +87,8 @@ private final class AudioWorker: @unchecked Sendable {
     private var originalMixLevel: Float = 0.2
     private var originalDucking = true
     private var speechMuted = false
-    private var convertedOriginal = false
     private var translatedMode = true
     private var active = false
-    private var attached = false
     private var inputCapture: DeviceInputCapture?
     private var input: AudioDevice?
     private var output: AudioDevice?
@@ -100,6 +98,7 @@ private final class AudioWorker: @unchecked Sendable {
     private var captureGeneration = UUID()
     private var retiredCaptureMetrics = CaptureMetrics()
     private var playbackQueue = BufferedAudioPlayback(prebufferFrames: 7200)
+    let audibleStarts = AudibleStartLog()
     private var playbackGeneration = UUID()
     private var outputVolume: Float = 1
     private var bufferingDeadline: DispatchWorkItem?
@@ -154,10 +153,8 @@ private final class AudioWorker: @unchecked Sendable {
             if active { playback.mainMixerNode.outputVolume = outputVolume }
         }
     }
-    private var scheduler: any AudioBufferScheduling {
-        if let renderMixer { return renderMixer }
-        return NativeAudioBufferScheduler(player: player)
-    }
+    /// Translated audio goes through the render mixer, which every started session has.
+    private var scheduler: (any AudioBufferScheduling)? { renderMixer }
 
     func start(input: AudioDevice, output: AudioDevice, destination: AudioDestination, translated: Bool,
                deliver: @escaping @Sendable (Data) throws -> Void,
@@ -170,6 +167,7 @@ private final class AudioWorker: @unchecked Sendable {
             translatedMode = translated
             renderMixer = nil
             playbackQueue = BufferedAudioPlayback(prebufferFrames: translated ? 7200 : 0)
+            audibleStarts.reset()
             self.input = input; self.output = output
             // Device binding and Bluetooth profile negotiation can change the graph during
             // startup. Observe first, then handle notifications on this serial control queue.
@@ -188,7 +186,6 @@ private final class AudioWorker: @unchecked Sendable {
                 try AudioDevices.select(output.id, on: playback.outputNode.audioUnit)
                 inputCapture = try DeviceInputCapture(device: input.id)
                 reportFormats(stage: "device bound")
-                if !attached { playback.attach(player); attached = true }
                 // Translated sessions always mix, so the original plays until the first translated speech.
                 let originalLevel: Float
                 if !translated { originalLevel = 1 } else if originalMixEnabled { originalLevel = originalMixLevel } else { originalLevel = 0 }
@@ -371,7 +368,7 @@ private final class AudioWorker: @unchecked Sendable {
                 if rebuildPlayback {
                     let discarded = playbackQueue.queuedFrames
                     discardQueuedPlayback()
-                    player.stop(); playback.stop()
+                    playback.stop()
                     playback.disconnectNodeOutput(playback.mainMixerNode)
                     try connectPlaybackToHardware()
                     onNotice(String(format: "Playback route recovery discarded %.3f seconds of queued audio.", Double(discarded) / 24_000))
@@ -428,7 +425,6 @@ private final class AudioWorker: @unchecked Sendable {
         #if BABELFIN_AUDIO_TRACE
         let diagnostics = CaptureDeliveryDiagnostics()
         #endif
-        convertedOriginal = renderMixer != nil
         let originalSink: (@Sendable (Data) throws -> Void)?
         if let mixer = renderMixer {
             originalSink = { [weak self] pcm in
@@ -450,7 +446,8 @@ private final class AudioWorker: @unchecked Sendable {
             }
         } else { originalSink = nil }
         let conversion = try CaptureConversion(sourceFormat: format, target: target, loopback: input?.isBlackHole == true,
-            packetFrames: translatedMode ? 2400 : 480, convertedPCM: originalSink)
+            // 50 ms packets in translated mode: the recognizer and the segment cutter see the end of speech sooner.
+            packetFrames: translatedMode ? 1200 : 480, convertedPCM: originalSink)
         let maximumFrames = inputCapture.maximumFrames
         let delivery = try CaptureDelivery(conversion: conversion, maximumFrames: maximumFrames, initiallyAccepting: false,
             deliver: { [weak self] pcm in
@@ -482,10 +479,8 @@ private final class AudioWorker: @unchecked Sendable {
             #if BABELFIN_BENCHMARK
             try benchmarkAssertRoutes()
             #endif
-            if !translatedMode {
-                if !convertedOriginal { try playLocked(pcm) }
-                return nil
-            }
+            // The original reaches the render mixer through the conversion's own sink.
+            if !translatedMode { return nil }
             return onPCM
         }
         // CaptureDelivery still owns synchronous ordering and its bounded slot. External
@@ -527,7 +522,16 @@ private final class AudioWorker: @unchecked Sendable {
             samples.withUnsafeBufferPointer { channels[channel].update(from: $0.baseAddress!, count: samples.count) }
         }
         let oldRefills = playbackQueue.refillCount
+        let wasBuffering = playbackQueue.isBuffering
+        guard let scheduler else { throw BridgeError.unavailable("Playback is not ready. Start again.") }
         try playbackQueue.append(buffer, on: scheduler)
+        let now = ProcessInfo.processInfo.systemUptime
+        if playbackQueue.isBuffering {
+            audibleStarts.admitted(at: now, queuedAhead: nil)
+        } else {
+            if wasBuffering { audibleStarts.started(at: now) }
+            audibleStarts.admitted(at: now, queuedAhead: Double(playbackQueue.queuedFrames - samples.count) / 24_000)
+        }
         if renderMixer?.snapshot.schedulingFailed == true {
             throw BridgeError.unavailable("Mixed playback rejected an audio buffer. Stop and start again.")
         }
@@ -563,7 +567,8 @@ private final class AudioWorker: @unchecked Sendable {
             guard let self, self.active, self.playbackGeneration == generation else { return }
             self.bufferingDeadline = nil
             if self.playback.isRunning {
-                self.playbackQueue.flush(on: self.scheduler)
+                if let scheduler = self.scheduler { self.playbackQueue.flush(on: scheduler) }
+                self.audibleStarts.started(at: ProcessInfo.processInfo.systemUptime)
                 if self.renderMixer?.snapshot.schedulingFailed == true {
                     self.fail("Mixed playback rejected an audio buffer. Stop and start again.")
                 }
@@ -590,10 +595,9 @@ private final class AudioWorker: @unchecked Sendable {
             guard active, routeIntact() else { throw BridgeError.unavailable("The selected devices are unavailable.") }
             playbackGeneration = UUID(); bufferingDeadline?.cancel(); bufferingDeadline = nil
             playbackQueue.reset()
-            if let renderMixer {
-                renderMixer.switchToTranslation(originalLevel: originalMixEnabled ? originalMixLevel : 0, ducking: originalDucking)
-            } else { player.stop() }
+            renderMixer?.switchToTranslation(originalLevel: originalMixEnabled ? originalMixLevel : 0, ducking: originalDucking)
             playbackQueue = BufferedAudioPlayback(prebufferFrames: 7200)
+            audibleStarts.reset()
             onPCM = deliver; translatedMode = true
         }
     }
@@ -604,7 +608,6 @@ private final class AudioWorker: @unchecked Sendable {
             playbackGeneration = UUID()
             bufferingDeadline?.cancel(); bufferingDeadline = nil
             playbackQueue = playbackQueue.continuingOriginal(on: renderMixer)
-            if renderMixer == nil { player.stop() }
         }
     }
     func stop() { control.sync { stopLocked(discardCapture: true) } }
@@ -627,7 +630,7 @@ private final class AudioWorker: @unchecked Sendable {
         if discardCapture { captureDelivery?.cancel() }
         // Silence scheduled output before potentially slow input-device teardown.
         renderMixer?.stop()
-        player.stop(); playback.stop()
+        playback.stop()
         if let renderSource { playback.detach(renderSource); self.renderSource = nil }
         detachCaptureSink()
         if let captureDelivery { retiredCaptureMetrics = captureDelivery.snapshot }

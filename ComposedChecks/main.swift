@@ -43,16 +43,34 @@ private func expect(_ condition: @autoclosure () -> Bool, _ message: String) thr
     var calls: [String] = []
     var blocked = false
     var failure: Error?
-    var waiter: CheckedContinuation<String, Error>?
+    /// Blocked calls in arrival order; `waiter` is the oldest.
+    var waiters: [CheckedContinuation<String, Error>] = []
+    var waiter: CheckedContinuation<String, Error>? { waiters.first }
     var cancels = 0
+    var concurrency = 1
+    var maximumConcurrentRequests: Int { concurrency }
     func translate(text: String, sourceLanguage: String?, targetLanguage: String, credentials: ProviderCredentials) async throws -> String {
         calls.append(text)
         if let failure { throw failure }
-        if blocked { return try await withCheckedThrowingContinuation { waiter = $0 } }
+        if blocked { return try await withCheckedThrowingContinuation { waiters.append($0) } }
         return "translated: " + text
     }
     func cancel() { cancels += 1 }
-    func release(_ value: String = "late translation") { let waiter = waiter; self.waiter = nil; waiter?.resume(returning: value) }
+    func release(_ value: String = "late translation") { guard !waiters.isEmpty else { return }; waiters.removeFirst().resume(returning: value) }
+    /// When set, a translation streams its first part, waits for `release`, then streams the rest.
+    var streamed: (first: String, rest: String)?
+    func translate(text: String, sourceLanguage: String?, targetLanguage: String, credentials: ProviderCredentials,
+                   into progress: StreamingTranslation) async throws -> String {
+        guard let streamed else {
+            let translated = try await translate(text: text, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage, credentials: credentials)
+            progress.append(translated); return translated
+        }
+        calls.append(text)
+        progress.append(streamed.first)
+        _ = try await withCheckedThrowingContinuation { waiters.append($0) }
+        progress.append(streamed.rest)
+        return streamed.first + streamed.rest
+    }
 }
 @MainActor private final class Synthesizer: SpeechSynthesisStage {
     var calls: [String] = []
@@ -168,6 +186,33 @@ private final class Clock: @unchecked Sendable {
             for (index, text) in ["a", "b", "c"].enumerated() { await alwaysSilent.recognizer.emit(.init(id: "q\(index)", text: text, isFinal: true, language: "en")) }
             try await until { alwaysSilent.events.failures.contains { $0.hasPrefix("speech_synthesis_failed") } }
             alwaysSilent.provider.cancel()
+            // A stage with three slots translates waiting passages as they arrive; speech keeps their order.
+            let eager = Fixture(); eager.translator.concurrency = 3; eager.translator.blocked = true; try await eager.start()
+            for (index, text) in ["one", "two", "three"].enumerated() { await eager.recognizer.emit(.init(id: "e\(index)", text: text, isFinal: true, language: "en")) }
+            try await until { eager.translator.calls.count == 3 }
+            eager.translator.blocked = false
+            for _ in 0..<3 { eager.translator.release("translated: " + eager.translator.calls[3 - eager.translator.waiters.count]) }
+            try await until { eager.synthesizer.calls.count == 3 }
+            try expect(eager.synthesizer.calls == ["translated: one", "translated: two", "translated: three"] && eager.events.failures.isEmpty,
+                       "Passages translated at once are spoken in commit order: \(eager.synthesizer.calls)")
+            eager.provider.cancel()
+            let onDemand = Fixture(); onDemand.translator.blocked = true; try await onDemand.start()
+            for (index, text) in ["one", "two", "three"].enumerated() { await onDemand.recognizer.emit(.init(id: "d\(index)", text: text, isFinal: true, language: "en")) }
+            try await until { onDemand.translator.calls.count == 1 }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            try expect(onDemand.translator.calls.count == 1, "A stage with one slot translates one passage at a time")
+            onDemand.provider.cancel()
+            // The first clause is spoken while the rest is translated; the transcript gets the whole text.
+            let early = Fixture(); early.translator.streamed = ("We meet on the third of May at ten, and", " then we take the rest."); try await early.start()
+            await early.recognizer.emit(.init(id: "c1", text: "Vi møtes", isFinal: true, language: "no"))
+            try await until { early.synthesizer.calls.count == 1 }
+            try expect(early.synthesizer.calls == ["We meet on the third of May at ten,"] && early.events.targets.isEmpty,
+                       "The first clause speaks before the translation ends: \(early.synthesizer.calls)")
+            early.translator.release()
+            try await until { early.synthesizer.calls.count == 2 }
+            try expect(early.synthesizer.calls[1] == "and then we take the rest." && early.events.targets.map(\.text) == ["We meet on the third of May at ten, and then we take the rest."],
+                       "The rest follows, and the transcript shows the whole translation: \(early.synthesizer.calls)")
+            early.provider.cancel()
             let live = Fixture(); try await live.start()
             let withSpeakers = TranslationConfiguration(targetLanguage: "no", route: .elevenLabs, voiceID: "fixture-voice", speakerVoices: ["a"])
             try expect(!live.provider.applyLive(withSpeakers), "Turning speaker voices on needs a new session")

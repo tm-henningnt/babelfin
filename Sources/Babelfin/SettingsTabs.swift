@@ -19,6 +19,7 @@ struct GeneralSettingsView: View {
                     Text("Compact controls").tag(true)
                 }.pickerStyle(.radioGroup)
             } header: { Text("Window") }
+            AutoExportSection()
             SubtitleSettingsSection()
             Section {
                 LabeledContent("Version", value: version)
@@ -79,7 +80,7 @@ struct DeviceSettingsView: View {
 
 /// Settings › Languages and services: suggestions for both directions, then each direction's details.
 struct LanguageSettingsView: View {
-    enum Page: Hashable { case suggestions, speak, listen }
+    enum Page: Hashable { case suggestions, speak, listen, glossary }
     @ObservedObject var conversation: ConversationModel
     @Binding var page: Page
     var openAccounts: () -> Void
@@ -89,6 +90,7 @@ struct LanguageSettingsView: View {
                 Text("Suggestions").tag(Page.suggestions)
                 Text("Speak").tag(Page.speak)
                 Text("Listen").tag(Page.listen)
+                Text("Glossary").tag(Page.glossary)
             }
             .pickerStyle(.segmented).labelsHidden().fixedSize()
             .padding(.top, 12)
@@ -101,8 +103,33 @@ struct LanguageSettingsView: View {
             case .listen:
                 SettingsView(model: conversation.incoming, direction: .incoming, allAudioStopped: { !conversation.locked }, openAccounts: openAccounts)
                     .id(Page.listen)
+            case .glossary:
+                GlossarySettingsView()
             }
         }
+    }
+}
+
+/// Settings › Languages and services › Glossary: names and terms to spell exactly.
+struct GlossarySettingsView: View {
+    @AppStorage(GlossaryStore.key) private var text = ""
+    var body: some View {
+        Form {
+            Section {
+                TextEditor(text: $text)
+                    .font(.body).frame(minHeight: 220).scrollContentBackground(.hidden)
+                    .accessibilityLabel("Glossary, one name or term per line")
+                HStack {
+                    Text("\(Glossary.terms(from: text).count) of \(Glossary.maximumTerms) terms").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    Spacer()
+                    Button("Clear") { text = "" }.disabled(text.isEmpty)
+                }
+            } header: { Text("Names and terms") } footer: {
+                Text("One per line, up to five words each. Translation spells them as written. When Scribe transcribes a file or a recording, it listens for them; this adds 20% to its price.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 

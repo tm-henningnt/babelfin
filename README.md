@@ -8,7 +8,7 @@ Live speech translation for macOS. Speak into a call in Zoom, Teams, Slack or an
 
 Apple Silicon (arm64), macOS 13 or later. Made by **Henning Naarlien-Tolpinrud**.
 
-<p align="center"><img src="Assets/Brand/Web/screenshot-main.png" alt="Babelfin Home with Speak and Listen side by side" width="900"></p>
+<p align="center"><img src="Assets/Brand/Web/screenshot-main.png" alt="Babelfin Home with Speak and Listen side by side and the sidebar with Translate, Meetings and Tools" width="900"></p>
 
 ## How it works
 
@@ -104,7 +104,7 @@ In **Settings › Advanced › Translation server**, you can enter an OpenAI-com
 
 ## Tools
 
-Choose **Tools** in the sidebar to work with a voice clip, a recording or meeting text:
+The **Tools** group in the sidebar works with a voice clip, a recording or meeting text:
 
 - **Audio file:** transcribe a local recording, or record from a microphone, with OpenAI or ElevenLabs. Add speaker labels with ElevenLabs, and translate the resulting text with OpenAI. Copy or save the original and translation.
 - **Dub:** after you translate an ElevenLabs transcript, **Create dub** speaks each translated passage at its original time with the voice and delivery from Voice clip. A passage that is longer than its slot plays up to 1.3 times faster. Turn on **Keep the original under the dub** to hear the original quietly underneath. A dub covers up to 15 minutes; save it as a WAV file.
@@ -118,11 +118,21 @@ Each action shows which service it uses. Files and recordings are uploaded only 
 
 <p align="center"><img src="Assets/Brand/Web/screenshot-compact.png" alt="Compact controls for both directions" width="440"></p>
 
+## Record a meeting
+
+Choose **Record** in the sidebar to record an online meeting (your microphone and the meeting audio from the Listen loopback, as two tracks) or a meeting in the room (one microphone), for up to 8 hours, with or without translation. Tell everyone that you are recording; you are responsible for their consent. The recording stays in a temporary file on this Mac until you discard it, start a new one or quit.
+
+Choose **Transcribe**: ElevenLabs Scribe labels the speakers and uses your microphone track to find which one is you (about $0.22 per hour), or On this Mac transcribes each track with nothing sent and no speaker labels. **Notes** in the sidebar shows the result beside the live transcript. Name the speakers, then make a clean version or notes, translate the notes, draft a follow-up email or ask questions; OpenAI receives the text for these. Notes have a summary, key points by topic, decisions, action items with owner and due date, key facts and next steps, each with its time in the meeting. What you write in Record while the meeting runs comes first. Templates cover 1:1s, stand-ups, customer calls, interviews and lectures. **Notes and Export…** on the Live transcript page does the same for a live translated meeting without a recording. Export the transcript as text, SRT or WebVTT, and save the audio as M4A or WAV.
+
+**Settings › General › Save to a folder** saves transcripts and notes automatically as Markdown with front matter, one folder per meeting by year and month, for Obsidian and other note tools. It is off until you turn it on.
+
+**Running notes**, on Home, keep notes of a live meeting so far and update them every two minutes. **Settings › Languages and services › Glossary** keeps names and terms for translation, transcription and notes.
+
 ## Meeting text and privacy
 
 **Transcript** in the sidebar brings together original and translated text from both directions. Copy it with an optional prompt for another chatbot, or explicitly save it as plain text or JSON. It covers periods when translation is active, with gaps while translation is off or muted. Original-only audio is not transcribed. Text can be incomplete and is not necessarily attributed to individual speakers.
 
-Babelfin tells you when the transcript is full; save and clear it to continue. Text stays in memory until cleared or you quit, unless you choose to copy or save it. Babelfin does not record your live audio. Selected services process audio or text, and their terms, retention policies and charges apply.
+Babelfin tells you when the transcript is full; save and clear it to continue. Text stays in memory until cleared or you quit, unless you choose to copy or save it. Babelfin records audio only when you choose Record, into a temporary file that it deletes when you discard the recording or quit. Selected services process audio or text, and their terms, retention policies and charges apply.
 
 To update, choose **Babelfin → Check for Updates…**. Babelfin contacts GitHub only when you choose this, verifies the download against the release checksum, and restores the previous version if the update fails.
 

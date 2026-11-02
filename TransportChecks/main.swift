@@ -8,10 +8,10 @@ import BridgeCore
         let send: @Sendable (String) async throws -> Void
         let receive: @Sendable () async throws -> Data
         let cancel: @Sendable () -> Void
-        let limit = args[1] == "openai" ? 400_000 : 65_536
+        let limit = args[1] == "openai" ? 800_000 : 65_536
         if args[1] == "openai" {
             let socket = URLTranslationWebSocket(testURL: url)
-            guard socket.messageLimitForChecks == 400_000 else { exit(3) }
+            guard socket.messageLimitForChecks == 800_000 else { exit(3) }
             send = { try await socket.send($0) }; receive = { try await socket.receive() }; cancel = { socket.cancel() }
         } else {
             var request = URLRequest(url: url)

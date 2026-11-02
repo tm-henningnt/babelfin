@@ -12,6 +12,9 @@ public enum TranslationPacing: String, CaseIterable, Codable, Sendable {
     public var minimumSegmentSeconds: Double { switch self { case .fast: 2; case .balanced: 4; case .context: 6 } }
     /// Unbroken speech is cut here.
     public var maximumSegmentSeconds: Double { switch self { case .fast: 5; case .balanced: 8; case .context: 12 } }
+    /// After this much speech, a short pause commits the segment when the latest partial transcript
+    /// ends a sentence. More context waits for the normal rules.
+    public var sentenceCommitSeconds: Double? { switch self { case .fast: 1.2; case .balanced: 1.5; case .context: nil } }
     /// Silence after which the recognition service commits a segment by itself.
     public var commitSilenceSeconds: Double { switch self { case .fast: 0.35; case .balanced: 0.45; case .context: 0.6 } }
     /// The rate controller keeps each segment's speech this long after its commit.
@@ -71,11 +74,18 @@ public struct PassageTiming: Equatable, Sendable {
     public let totalSeconds: Double
     public let speechSeconds: Double
     public let rate: Double
+    /// System uptime when the first translated audio was handed to playback.
+    public let handedOffAt: TimeInterval?
+    /// From the hand-off to the first audible sample: the playback buffer, or audio queued ahead.
+    public var playbackSeconds: Double?
     public init(passageSeconds: Double?, translateSeconds: Double?, voiceSeconds: Double?, preparedAhead: Bool,
-                totalSeconds: Double, speechSeconds: Double, rate: Double) {
+                totalSeconds: Double, speechSeconds: Double, rate: Double, handedOffAt: TimeInterval? = nil, playbackSeconds: Double? = nil) {
         self.passageSeconds = passageSeconds; self.translateSeconds = translateSeconds; self.voiceSeconds = voiceSeconds
         self.preparedAhead = preparedAhead; self.totalSeconds = totalSeconds; self.speechSeconds = speechSeconds; self.rate = rate
+        self.handedOffAt = handedOffAt; self.playbackSeconds = playbackSeconds
     }
+    /// From the commit to the first audible sample, when the playback start is known.
+    public var audibleSeconds: Double? { playbackSeconds.map { totalSeconds + $0 } }
     /// Time spent waiting for the previous passage to finish playing.
     public var waitSeconds: Double {
         preparedAhead ? totalSeconds : max(0, totalSeconds - (translateSeconds ?? 0) - (voiceSeconds ?? 0))

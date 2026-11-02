@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.6.0</string>
+	<string>0.7.0</string>
 	<key>CFBundleVersion</key>
-	<string>20</string>
+	<string>21</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -30,7 +30,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Babelfin captures your selected microphone or loopback audio source to translate speech, or pass original audio to your chosen output.</string>
+	<string>Babelfin captures your selected microphone or loopback audio source to translate speech, pass original audio to your chosen output, or record a meeting when you choose Record.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>The On this Mac route recognizes speech with Apple's on-device speech models. The audio stays on your Mac.</string>
 </dict>

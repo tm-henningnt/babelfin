@@ -32,7 +32,7 @@ import BridgeCore
                 }.value
                 try token.check(); try Task.checkCancellation()
                 request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-                let response = OpenAIRecordingBuffer(maximumBytes: Self.responseBytes)
+                let response = SpeechToolsBuffer(maximumBytes: Self.responseBytes)
                 try await transport.stream(request, maximumBytes: Self.responseBytes, contentTypes: ["application/json"]) { bytes in
                     try token.check(); try Task.checkCancellation(); try response.append(bytes)
                 }
@@ -71,6 +71,8 @@ import BridgeCore
                      "mpeg": "audio/mpeg", "mpga": "audio/mpeg", "webm": "audio/webm",
                      "flac": "audio/flac", "ogg": "audio/ogg"]
         if case .file(let url) = source, url.isFileURL, types[url.pathExtension.lowercased()] == nil { throw SpeechToolsError.unsupportedFormat }
+        // OpenAI accepts 25 MB; meeting recordings go to Scribe or On this Mac.
+        if case .meeting = source { throw SpeechToolsError.recordingTooLarge }
         let audio = try source.upload(check: token.check)
         guard let mime = types[audio.fileExtension] else { throw SpeechToolsError.unsupportedFormat }
         let boundary = "Babelfin-" + UUID().uuidString
@@ -166,17 +168,4 @@ import BridgeCore
         }
         return result
     }
-}
-
-private final class OpenAIRecordingBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private let maximumBytes: Int
-    private var bytes = Data()
-    init(maximumBytes: Int) { self.maximumBytes = maximumBytes }
-    func append(_ data: Data) throws {
-        lock.lock(); defer { lock.unlock() }
-        guard data.count <= maximumBytes - bytes.count else { throw ProviderNetworkError.overflow }
-        bytes.append(data)
-    }
-    func data() -> Data { lock.lock(); defer { lock.unlock() }; return bytes }
 }

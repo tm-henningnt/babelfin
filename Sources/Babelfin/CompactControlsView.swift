@@ -196,6 +196,7 @@ private struct CompactWindowLevel: NSViewRepresentable {
 
 struct CompactControlsView: View {
     @ObservedObject var conversation: ConversationModel
+    @ObservedObject private var recorder = MeetingRecorder.shared
     var open: (MainSection) -> Void
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(CompactPreferences.onTop) private var onTop = false
@@ -204,6 +205,19 @@ struct CompactControlsView: View {
             CompactDirectionView(model: conversation.outgoing, incoming: false) { open(.home) }
             Divider()
             CompactDirectionView(model: conversation.incoming, incoming: true) { open(.home) }
+            if recorder.state == .recording {
+                Divider()
+                HStack(spacing: 8) {
+                    Image(systemName: "record.circle.fill").foregroundStyle(.red).accessibilityHidden(true)
+                    Text("Recording \(RecorderCard.clock(recorder.seconds))").monospacedDigit()
+                    Spacer()
+                    Button("Stop") { recorder.stop() }.controlSize(.small)
+                }
+            } else if !recorder.notice.isEmpty {
+                Divider()
+                Label(recorder.notice, systemImage: "exclamationmark.triangle").font(.callout)
+                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.horizontal, 16).padding(.top, 2).padding(.bottom, 14)
         // The buttons share the title bar with the close button.

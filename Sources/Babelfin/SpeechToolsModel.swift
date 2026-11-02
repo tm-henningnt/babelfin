@@ -17,10 +17,23 @@ enum SpeechToolsPage: String, CaseIterable, Identifiable {
 }
 
 enum RecordingService: String, CaseIterable, Identifiable {
-    case elevenLabs, openAI
+    case elevenLabs, openAI, onThisMac
     var id: String { rawValue }
-    var title: String { self == .elevenLabs ? "ElevenLabs" : "OpenAI" }
-    var account: ProviderService { self == .elevenLabs ? .elevenLabs : .openAI }
+    var title: String {
+        switch self {
+        case .elevenLabs: return "ElevenLabs"
+        case .openAI: return "OpenAI"
+        case .onThisMac: return "On this Mac"
+        }
+    }
+    /// The key the service needs; On this Mac needs none.
+    var account: ProviderService? {
+        switch self {
+        case .elevenLabs: return .elevenLabs
+        case .openAI: return .openAI
+        case .onThisMac: return nil
+        }
+    }
 }
 
 /// One generated voice clip, kept so takes with different directions can be compared.
@@ -158,7 +171,11 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
     @Published private var recordingAttemptIncomplete = false
     @Published var notesInput: String { didSet { if notesInput != oldValue { notesResult = nil; clearNotice() } } }
     @Published private(set) var notesResult: MeetingNotes?
-    @Published var voiceText = "" { didSet { if voiceText != oldValue { clearTakes(); clearNotice() } } }
+    @Published var voiceText = "" { didSet { if voiceText != oldValue { clearTakes(); clearNotice(); spokenText = nil } } }
+    /// Translate the text into the clip language before it is spoken (OpenAI).
+    @Published var voiceTranslates = false { didSet { if voiceTranslates != oldValue { clearTakes(); spokenText = nil } } }
+    /// The translation that the last take spoke.
+    @Published private(set) var spokenText: String?
     @Published var voiceProvider: ClipVoiceService = .elevenLabs {
         didSet {
             guard voiceProvider != oldValue else { return }
@@ -252,8 +269,12 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
         recording != nil && (recordingAttemptIncomplete || completedRecordingSignature != recordingSignature)
     }
     var voiceAccount: ProviderService? { voiceProvider.account }
-    var voiceKeyMissing: Bool { voiceAccount.map(missingKeys.contains) ?? false }
-    private var voiceAccounts: Set<ProviderService> { voiceAccount.map { [$0] } ?? [] }
+    var voiceKeyMissing: Bool { voiceAccounts.contains { missingKeys.contains($0) } }
+    private var voiceAccounts: Set<ProviderService> {
+        var services: Set<ProviderService> = voiceAccount.map { [$0] } ?? []
+        if voiceTranslates && voiceSource == .text { services.insert(.openAI) }
+        return services
+    }
     var canGenerate: Bool {
         !busy && !voiceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         && voiceText.count <= SpeechToolsLimits.voiceCharacters && voiceText.utf8.count <= 8_000
@@ -341,14 +362,20 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
         let signature = recordingSignature
         let language = TranslationLanguage.elevenLabsOutputs.first(where: { $0.code == source })?.name ?? "Automatic language"
         recordingAttemptIncomplete = true
-        perform("Transcribing audio…", services: [selectedService.account]) { model, keys in
-            let transcriber = selectedService == .elevenLabs ? model.service : SpeechToolsService(transcriber: OpenAIRecordingTranscriber())
+        perform("Transcribing audio…", services: Set([selectedService.account].compactMap { $0 })) { model, keys in
+            let transcriber: SpeechToolsService
+            switch selectedService {
+            case .elevenLabs: transcriber = model.service
+            case .openAI: transcriber = SpeechToolsService(transcriber: OpenAIRecordingTranscriber())
+            case .onThisMac: transcriber = SpeechToolsService(transcriber: OnThisMacRecordingTranscriber(), operationTimeout: 3_000)
+            }
             model.fileService = transcriber
             transcriber.onProgress = { [weak model] in model?.progress = $0 }
             defer { model.fileService = nil }
             let result = try await transcriber.transcribe(source: audio, sourceLanguage: source, diarize: speakers, credentials: keys)
             try model.checkCurrentOperation(); model.recording = result
             model.completedRecordingSignature = signature; model.recordingAttemptIncomplete = false
+            model.autoExportRecording()
             model.recordingContext = "\(selectedService.title) · \(language)\(speakers ? " · Speaker labels" : "")"
             model.notice = result.segments.isEmpty ? "No speech was found in this recording." : "Transcription finished."
         }
@@ -359,6 +386,7 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
         perform("Translating text…", services: [.openAI]) { model, keys in
             let result = try await model.service.translate(transcript: recording, targetLanguage: target, credentials: keys)
             try model.checkCurrentOperation(); model.recording = result; model.notice = "Translation finished."
+            model.autoExportRecording()
         }
     }
     /// A dub needs a translation with segment times and a ready voice from Voice clip.
@@ -381,6 +409,13 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
             guard model.recording == recording else { throw CancellationError() }
             model.dub = data; model.notice = "The dub is ready to save."
         }
+    }
+    /// Saves a transcript to the auto-export folder; the app sets it. It returns a message on failure.
+    static var autoExport: (@MainActor (RecordingTranscript, String) -> String?)?
+    private func autoExportRecording() {
+        guard let recording else { return }
+        let name = "Audio file " + (audioInput == .file ? fileURL?.deletingPathExtension().lastPathComponent ?? "recording" : "microphone recording")
+        if let failure = Self.autoExport?(recording, name) { showError(failure) }
     }
     func saveDub() { if let dub { save(dub, name: "Babelfin dub", extension: "wav") } }
     func useRecordingForNotes() {
@@ -417,15 +452,17 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
         if voiceSource == .recording { revoiceRecording(); return }
         guard canGenerate else { return }
         let text = voiceText, language = voiceLanguage, voice = voiceID.isEmpty ? nil : voiceID
-        let route = voiceProvider.route
+        let route = voiceProvider.route, translates = voiceTranslates
         let direction = SpeechDirection(delivery: voiceDelivery, speed: voiceSpeed)
-        perform("Generating voice clip…", services: voiceAccounts) { model, keys in
-            let data = try await model.service.voiceClip(text: text, language: language, voiceID: voice, route: route,
+        perform(translates ? "Translating and generating…" : "Generating voice clip…", services: voiceAccounts) { model, keys in
+            let spoken = translates ? try await model.service.translate(text: text, to: language, credentials: keys) : text
+            let data = try await model.service.voiceClip(text: spoken, language: language, voiceID: voice, route: route,
                                                          direction: direction, credentials: keys)
             try model.checkCurrentOperation()
-            guard model.voiceText == text, model.voiceLanguage == language,
+            guard model.voiceText == text, model.voiceLanguage == language, model.voiceTranslates == translates,
                   (model.voiceID.isEmpty ? nil : model.voiceID) == voice,
                   model.voiceProvider.route == route else { throw CancellationError() }
+            model.spokenText = translates ? spoken : nil
             model.addTake(data, direction: direction)
         }
     }
@@ -519,6 +556,14 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
             } else { data = Data(recording.plainText().utf8) }
             save(data, name: "Babelfin recording", extension: json ? "json" : "txt")
         } catch { showError("Could not prepare the transcript. Try saving as plain text.") }
+    }
+    /// Saves the recording's timed segments as a subtitle file.
+    func saveSubtitles(_ format: SubtitleFile.Format, text: SubtitleFile.Text) {
+        guard let recording else { return }
+        guard !SubtitleFile.cues(recording.segments, text: text).isEmpty else { showError("This transcript has no timed text for subtitles."); return }
+        let content = SubtitleFile.make(recording.segments, text: text, format: format)
+        save(Data(content.utf8), name: text == .translation ? "Babelfin subtitles (translation)" : "Babelfin subtitles",
+             extension: format.fileExtension)
     }
     func saveNotes() { if let notesResult { save(Data(notesResult.text.utf8), name: "Babelfin notes", extension: "txt") } }
     func saveClip() {

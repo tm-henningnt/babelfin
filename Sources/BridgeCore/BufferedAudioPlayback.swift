@@ -9,6 +9,7 @@ public final class BufferedAudioPlayback {
     public static let maximumPrebufferFrames = 28_800
     static let steadyFramesPerDecrease = 240_000
     /// Speech that resumes sooner than this after draining is jitter, not a natural pause.
+    /// A longer pause resets the target to the start value.
     static let jitterGapSeconds: TimeInterval = 1.0
     private let queue = PlaybackBufferQueue()
     private let minimumPrebufferFrames: Int
@@ -30,8 +31,13 @@ public final class BufferedAudioPlayback {
             scheduler.pausePlayback()
             playing = false
             refillCount += 1
-            if minimumPrebufferFrames > 0, let gap = queue.secondsSinceDrained, gap < Self.jitterGapSeconds {
-                prebufferFrames = min(Self.maximumPrebufferFrames, prebufferFrames + Self.jitterStepFrames)
+            if minimumPrebufferFrames > 0, let gap = queue.secondsSinceDrained {
+                if gap < Self.jitterGapSeconds {
+                    prebufferFrames = min(Self.maximumPrebufferFrames, prebufferFrames + Self.jitterStepFrames)
+                } else {
+                    // A natural pause ended the passage; the next one starts from the minimum again.
+                    prebufferFrames = minimumPrebufferFrames
+                }
                 steadyFrames = 0
             }
         }

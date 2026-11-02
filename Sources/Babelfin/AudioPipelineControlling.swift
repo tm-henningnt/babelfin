@@ -20,6 +20,7 @@ import BridgeCore
     func stop()
     func stopAndDrain() async throws
     func metricsSummary() -> String
+    func audibleStart(after time: TimeInterval) -> TimeInterval?
 }
 
 extension AudioPipeline: AudioPipelineControlling {}
@@ -32,6 +33,7 @@ extension AudioPipeline: AudioPipelineControlling {}
 extension CoreAudioConsumerMonitor: ConsumerMonitoring {}
 
 extension AudioPipelineControlling {
+    func audibleStart(after time: TimeInterval) -> TimeInterval? { nil }
     func translatedSink() -> TranslationAudioHandler { { [weak self] pcm in guard let self else { return }; try await self.playTranslated(pcm) } }
     func switchToTranslation(deliver: @escaping @Sendable (Data) throws -> Void) throws { throw BridgeError.unavailable("This audio route cannot resume translation.") }
     func switchToOriginal() throws { throw BridgeError.unavailable("This audio route cannot switch to original audio.") }
