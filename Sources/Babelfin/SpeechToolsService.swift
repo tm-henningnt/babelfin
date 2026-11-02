@@ -435,6 +435,8 @@ enum RecordingAudioDecoder {
         guard Double(file.length) / input.sampleRate <= maximumSeconds + 1 else { throw SpeechToolsError.recordingTooLong }
         guard let output = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false),
               let converter = AVAudioConverter(from: input, to: output) else { throw SpeechToolsError.invalidRecording }
+        // A stereo meeting can have speakers on different channels: mix them, do not drop one.
+        converter.downmix = true
         let block = AVAudioFrameCount(input.sampleRate * 10)
         var finished = false
         while !finished {

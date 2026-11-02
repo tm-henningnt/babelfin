@@ -5,8 +5,9 @@ import BridgeCore
 /// Records a meeting into temporary files: the microphone, and for an online meeting also the
 /// meeting audio from the Listen loopback, as separate tracks. It only reads inputs; it never
 /// plays audio or changes a device. Each capture is bound to its device ID, so the system default
-/// input is never opened. The files live in this app's temporary folder and are deleted on
-/// discard, on a new recording, at quit, and at the next launch.
+/// input is never opened. An audio file can also be opened as a recording. The files live in this
+/// app's temporary folder and are deleted on discard, on a new recording and at quit; an update
+/// keeps them for the next launch.
 @MainActor final class MeetingRecorder: ObservableObject {
     static let shared = MeetingRecorder()
     enum State: Equatable { case idle, recording, stopped }
@@ -17,6 +18,8 @@ import BridgeCore
     @Published private(set) var kind = MeetingRecordingKind.online
     @Published private(set) var startedAt: Date?
     @Published private(set) var notice = ""
+    /// True while an audio file is converted into a recording.
+    @Published private(set) var opening = false
     /// The tracks of the current recording: the microphone first.
     private(set) var tracks: [URL] = []
     private var captures: [(DeviceInputCapture, AudioDevice)] = []
@@ -48,12 +51,46 @@ import BridgeCore
         state = .stopped
         notice = "Babelfin kept a recording from the last session. Transcribe, save or discard it."
     }
+    /// Opens an audio file of up to 8 hours as a stopped recording in the room: it is converted to
+    /// one 24 kHz mono track in this app's temporary folder, so it can be transcribed, saved and
+    /// discarded like a recording. The original file is not changed or deleted.
+    func open(_ file: URL) async {
+        guard state == .idle, !starting, !opening else { return }
+        opening = true; defer { opening = false }
+        notice = ""
+        let token = UUID(); generation = token
+        let directory = Self.folder.appendingPathComponent(token.uuidString, isDirectory: true)
+        let track = directory.appendingPathComponent("microphone.pcm")
+        let started = ProcessInfo.processInfo.systemUptime
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try await Task.detached {
+                try RecordingAudioDecoder.writeTrack(.file(file), to: track, maximumSeconds: Double(MeetingRecordingLimits.maximumSeconds))
+            }.value
+            let bytes = ((try? FileManager.default.attributesOfItem(atPath: track.path))?[.size] as? Int) ?? 0
+            guard bytes >= MeetingRecordingLimits.bytesPerSecond else { throw SpeechToolsError.invalidRecording }
+            guard generation == token, state == .idle else { try? FileManager.default.removeItem(at: directory); return }
+            tracks = [track]; kind = .room
+            startedAt = (try? file.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+            seconds = Double(bytes) / Double(MeetingRecordingLimits.bytesPerSecond)
+            state = .stopped
+            DiagnosticLog.shared.write("recorder", "opened a \(Int(seconds)) s file after \(DiagnosticLog.elapsed(since: started))")
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            DiagnosticLog.shared.write("recorder", "opening a file failed: \(DiagnosticLog.kind(of: error))")
+            switch error as? SpeechToolsError {
+            case .recordingTooLong?: notice = "Babelfin opens recordings up to 8 hours. Choose a shorter file."
+            default: notice = "Babelfin could not read this file. Choose a WAV, M4A, MP3, AIFF, CAF or FLAC file."
+            }
+        }
+    }
+
     private func modified(_ url: URL) -> Date {
         (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
     }
 
     func start(kind: MeetingRecordingKind, microphone: AudioDevice, meeting: AudioDevice?) async {
-        guard state != .recording, !starting else { return }
+        guard state != .recording, !starting, !opening else { return }
         starting = true; defer { starting = false }
         notice = ""
         guard microphone.isPhysicalInput else { notice = "Choose a microphone for Speak in Settings › Audio devices."; return }
@@ -120,6 +157,18 @@ import BridgeCore
         writers.forEach { $0.close() }
         state = .stopped
     }
+
+    /// True after `keepForUpdate`: quitting keeps the files for the next launch.
+    var keepsAtQuit = false
+    /// Before an update quits the app: stops a running recording and keeps the files, so the next
+    /// launch opens the recording again.
+    func keepForUpdate() {
+        stop()
+        keepsAtQuit = true
+        if hasRecording { DiagnosticLog.shared.write("recorder", "kept for the update") }
+    }
+    /// At quit: deletes the recording unless an update keeps it.
+    func quit() { if !keepsAtQuit { discard() } }
 
     /// Deletes the recording and its files.
     func discard() {

@@ -26,10 +26,10 @@ import BridgeCore
         if policy == .regular { NSApp.activate(ignoringOtherApps: true) }
     }
     func applicationWillTerminate(_ notification: Notification) { Self.onQuit?() }
-    /// Quitting deletes a meeting recording, so Babelfin asks first.
+    /// Quitting deletes a meeting recording, so Babelfin asks first. An update keeps it.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let recorder = MeetingRecorder.shared
-        guard recorder.state == .recording || recorder.hasRecording else { return .terminateNow }
+        guard !recorder.keepsAtQuit, recorder.state == .recording || recorder.hasRecording else { return .terminateNow }
         let alert = NSAlert()
         alert.messageText = recorder.state == .recording ? "A meeting is being recorded" : "You have a meeting recording"
         alert.informativeText = "Quitting deletes the recording. Save the audio or transcribe it first to keep it."
@@ -72,7 +72,7 @@ import BridgeCore
         LiveTranscriptExporter.shared.start(instance)
         SpeechToolsModel.autoExport = { AutoExport.export($0, name: $1, date: Date()) }
         _conversation = StateObject(wrappedValue: instance)
-        AppDelegate.onQuit = { callPrompt.close(); instance.abort(); MeetingRecorder.shared.discard(); MeetingModel.shared.stopRunningNotes() }
+        AppDelegate.onQuit = { callPrompt.close(); instance.abort(); MeetingRecorder.shared.quit(); MeetingModel.shared.stopRunningNotes() }
     }
     var body: some Scene {
         Window("Babelfin", id: "main") { ConversationView(conversation: conversation) }

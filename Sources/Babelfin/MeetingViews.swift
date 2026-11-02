@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import BridgeCore
 
 enum MeetingPreferences {
@@ -73,7 +74,14 @@ struct RecorderCard: View {
                 case .idle:
                     Button { record() } label: { Label("Record", systemImage: "record.circle.fill").frame(minWidth: 120) }
                         .buttonStyle(.borderedProminent).tint(.red).controlSize(.large)
-                        .disabled(microphone == nil || (kind == .online && meetingAudio == nil))
+                        .disabled(microphone == nil || (kind == .online && meetingAudio == nil) || recorder.opening)
+                    Button { openRecording() } label: { Label("Open Recording…", systemImage: "folder") }
+                        .controlSize(.large).disabled(recorder.opening)
+                        .help("Opens an audio file of up to 8 hours, for example a saved meeting, to transcribe it and make notes")
+                    if recorder.opening {
+                        ProgressView().controlSize(.small)
+                        Text("Opening…").font(.callout).foregroundStyle(.secondary)
+                    }
                 case .recording:
                     Button { recorder.stop() } label: { Label("Stop", systemImage: "stop.fill").frame(minWidth: 120) }
                         .buttonStyle(.borderedProminent).controlSize(.large)
@@ -224,6 +232,15 @@ struct RecorderCard: View {
     }
 
     private func record() { if consentShown { start() } else { state.askingConsent = true } }
+    private func openRecording() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a recording to transcribe. Babelfin opens a copy; the file is not changed."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if meeting.meetingTitle.isEmpty { meeting.meetingTitle = String(url.deletingPathExtension().lastPathComponent.prefix(80)) }
+        Task { await recorder.open(url) }
+    }
     private func start() {
         guard let microphone else { return }
         Task { await recorder.start(kind: kind, microphone: microphone, meeting: kind == .online ? meetingAudio : nil) }

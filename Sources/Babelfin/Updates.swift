@@ -369,9 +369,11 @@ enum UpdateInstaller {
             installProcess = try UpdateInstaller.start(archive: downloaded, update: update, onReady: { [weak self] in
                 self?.status = "Installing the update and reopening Babelfin…"
                 beforeQuit()
+                MeetingRecorder.shared.keepForUpdate()
                 NSApp.terminate(nil)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                     guard let self, self.installing, NSApp.isRunning else { return }
+                    MeetingRecorder.shared.keepsAtQuit = false
                     self.installing = false; self.failed = true
                     self.status = "Babelfin is still open. Close open dialogs or choose Quit to let the installer continue."
                 }
@@ -423,7 +425,7 @@ struct UpdatesView: View {
                 Link("Release on GitHub", destination: update.releaseURL)
             }
             if updater.downloaded != nil {
-                Text("Babelfin turns translation off, quits, replaces the app and opens it again. macOS may ask for microphone or Keychain access again after an update.")
+                Text("Babelfin turns translation off, quits, replaces the app and opens it again. A meeting recording stays and opens again. macOS may ask for microphone or Keychain access again after an update.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Divider()

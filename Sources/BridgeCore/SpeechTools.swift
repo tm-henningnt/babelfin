@@ -26,7 +26,7 @@ public enum SpeechToolsError: LocalizedError, Sendable, Equatable {
     case dubUntimed, dubTooLong, revoiceTooLong, recordingTooLong
     public var errorDescription: String? {
         switch self {
-        case .recordingTooLarge: return "Choose a recording up to 25 MB."
+        case .recordingTooLarge: return "Audio file takes recordings up to 25 MB. For a longer meeting, choose Record › Open Recording."
         case .recordingTooLong: return "On this Mac transcribes recordings up to one hour. Choose a shorter recording."
         case .invalidRecording: return "The recording could not be read. Choose a local audio file."
         case .unsupportedFormat: return "Choose a WAV, MP3, M4A, MP4, FLAC, OGG, or WebM recording."
