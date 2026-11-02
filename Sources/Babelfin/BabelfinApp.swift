@@ -8,6 +8,8 @@ import BridgeCore
     /// Babelfin lives in the menu bar. While one of its windows is open it is a regular app,
     /// so its menu bar (About, Check for Updates, Translation, Window, Help) and Dock icon appear.
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let info = Bundle.main.infoDictionary ?? [:]
+        DiagnosticLog.shared.write("app", "Babelfin \(info["CFBundleShortVersionString"] as? String ?? "?") (build \(info["CFBundleVersion"] as? String ?? "?")) started on macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         updateActivationPolicy()
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.willCloseNotification, NSWindow.didMiniaturizeNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in

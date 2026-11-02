@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 
 class Peer(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -52,6 +53,21 @@ class Peer(http.server.BaseHTTPRequestHandler):
         except (OSError, ValueError):
             pass
 
+    def do_POST(self):
+        if self.path != '/slow':
+            self.send_response(404); self.send_header('Content-Length', '0'); self.end_headers(); return
+        self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        time.sleep(2.5)
+        body = b'{"ok": true}'
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError:
+            pass
+
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     target_hits = 0
@@ -67,5 +83,8 @@ try:
             subprocess.run([sys.argv[1],provider,f'ws://127.0.0.1:{servers[0].server_address[1]}{path}',expected],check=True,timeout=6)
             assert sum(s.target_hits for s in servers) == before, 'redirect target was contacted'
             print('PASS:',provider,path,flush=True)
+    for expected in ('timeout', 'answer'):
+        subprocess.run([sys.argv[1],'http',f'http://127.0.0.1:{servers[0].server_address[1]}/slow',expected],check=True,timeout=15)
+        print('PASS: http /slow',expected,flush=True)
 finally:
     for server in servers: server.shutdown(); server.server_close()

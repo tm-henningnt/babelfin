@@ -5,6 +5,7 @@ import BridgeCore
     static func main() async {
         let args = CommandLine.arguments
         guard args.count == 4, let url = URL(string: args[2]) else { exit(2) }
+        if args[1] == "http" { await slowAnswer(url, expected: args[3]); return }
         let send: @Sendable (String) async throws -> Void
         let receive: @Sendable () async throws -> Data
         let cancel: @Sendable () -> Void
@@ -33,6 +34,21 @@ import BridgeCore
         } catch {
             guard args[3] == "refuse", error is SocketTransportError, ProcessInfo.processInfo.systemUptime - started < 2.5 else { print("FAIL: positive control"); exit(1) }
             print("PASS: refused without exposing response or credential")
+        }
+    }
+    /// The peer answers after 2.5 s. A 1 s limit must end as a timeout, not as a network failure; 10 s must get the answer.
+    static func slowAnswer(_ url: URL, expected: String) async {
+        let seconds: TimeInterval = expected == "timeout" ? 1 : 10
+        let transport = URLProviderHTTPTransport(requestTimeout: seconds, resourceTimeout: seconds)
+        var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = Data("{}".utf8)
+        do {
+            let body = try await transport.json(request)
+            guard expected == "answer", body["ok"] as? Bool == true else { print("FAIL: unexpected answer"); exit(1) }
+            print("PASS: slow answer within the limit")
+        } catch ProviderNetworkError.timedOut where expected == "timeout" {
+            print("PASS: limit reported as a timeout")
+        } catch {
+            print("FAIL: \(error)"); exit(1)
         }
     }
 }

@@ -96,11 +96,16 @@ To read a translation instead of hearing it, turn off **Speak the translation** 
 
 In **Settings › Advanced › Translation server**, you can enter an OpenAI-compatible server, for example Ollama or LM Studio, with a base URL and a model name. The ElevenLabs and Fish Audio routes can then use it for text translation instead of OpenAI. Babelfin sends the recognized text to that server. Plain HTTP is allowed only for this Mac and .local hosts.
 
+## Log file
+
+Babelfin writes session details, failed and slow service requests, recorder changes and meeting and tool steps to `~/Library/Logs/Babelfin/Babelfin.log`. Audio, API keys, transcripts, notes and full web addresses are excluded. **Settings › Advanced › Show Log File** selects the file in Finder. Above 5 MB the file becomes `Babelfin.1.log` and a new file starts.
+
 ## Uninstall
 
 1. In Settings → Accounts, choose **Remove all saved keys**.
 2. Quit Babelfin and move it to the Trash.
-3. To remove BlackHole as well, follow the [BlackHole uninstall instructions](https://github.com/ExistentialAudio/BlackHole#uninstallation-instructions).
+3. To remove the log files, delete the folder `~/Library/Logs/Babelfin`.
+4. To remove BlackHole as well, follow the [BlackHole uninstall instructions](https://github.com/ExistentialAudio/BlackHole#uninstallation-instructions).
 
 ## Tools
 
@@ -122,7 +127,7 @@ Each action shows which service it uses. Files and recordings are uploaded only 
 
 Choose **Record** in the sidebar to record an online meeting (your microphone and the meeting audio from the Listen loopback, as two tracks) or a meeting in the room (one microphone), for up to 8 hours, with or without translation. Tell everyone that you are recording; you are responsible for their consent. The recording stays in a temporary file on this Mac until you discard it, start a new one or quit.
 
-Choose **Transcribe**: ElevenLabs Scribe labels the speakers and uses your microphone track to find which one is you (about $0.22 per hour), or On this Mac transcribes each track with nothing sent and no speaker labels. **Notes** in the sidebar shows the result beside the live transcript. Name the speakers, then make a clean version or notes, translate the notes, draft a follow-up email or ask questions; OpenAI receives the text for these. Notes have a summary, key points by topic, decisions, action items with owner and due date, key facts and next steps, each with its time in the meeting. What you write in Record while the meeting runs comes first. Templates cover 1:1s, stand-ups, customer calls, interviews and lectures. **Notes and Export…** on the Live transcript page does the same for a live translated meeting without a recording. Export the transcript as text, SRT or WebVTT, and save the audio as M4A or WAV.
+Choose **Transcribe**: ElevenLabs Scribe labels the speakers and uses your microphone track to find which one is you (about $0.22 per hour), or On this Mac transcribes each track with nothing sent and no speaker labels. Choose the spoken language for Scribe when the whole meeting uses one language; detection can pick a similar language, for example Danish for Norwegian. Scribe needs about 4 minutes for a meeting of one hour. **Notes** in the sidebar shows the result beside the live transcript. Name the speakers, then make a clean version or notes, translate the notes, draft a follow-up email or ask questions; OpenAI receives the text for these. Notes have a summary, key points by topic, decisions, action items with owner and due date, key facts and next steps, each with its time in the meeting. What you write in Record while the meeting runs comes first. Templates cover 1:1s, stand-ups, customer calls, interviews and lectures. **Notes and Export…** on the Live transcript page does the same for a live translated meeting without a recording. Export the transcript as text, SRT or WebVTT, and save the audio as M4A or WAV.
 
 **Settings › General › Save to a folder** saves transcripts and notes automatically as Markdown with front matter, one folder per meeting by year and month, for Obsidian and other note tools. It is off until you turn it on.
 

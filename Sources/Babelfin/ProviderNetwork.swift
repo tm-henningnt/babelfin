@@ -85,17 +85,37 @@ final class URLProviderHTTPTransport: ProviderHTTPTransport, @unchecked Sendable
     deinit { session.invalidateAndCancel() }
     func stream(_ request: URLRequest, maximumBytes: Int, contentTypes: Set<String>,
                 onChunk: @escaping @Sendable (Data) async throws -> Void) async throws {
-        try await run(maximumBytes: maximumBytes, contentTypes: contentTypes, onChunk: onChunk) { $0.dataTask(with: request) }
+        try await run(request, maximumBytes: maximumBytes, contentTypes: contentTypes, onChunk: onChunk) { $0.dataTask(with: request) }
     }
     func upload(_ request: URLRequest, fromFile file: URL, maximumBytes: Int, contentTypes: Set<String>,
                 onChunk: @escaping @Sendable (Data) async throws -> Void) async throws {
-        try await run(maximumBytes: maximumBytes, contentTypes: contentTypes, onChunk: onChunk) { $0.uploadTask(with: request, fromFile: file) }
+        try await run(request, maximumBytes: maximumBytes, contentTypes: contentTypes, onChunk: onChunk) { $0.uploadTask(with: request, fromFile: file) }
     }
-    private func run(maximumBytes: Int, contentTypes: Set<String>, onChunk: @escaping @Sendable (Data) async throws -> Void,
+    /// Requests that fail, and requests that take more than `slowSeconds`, go to the diagnostic log:
+    /// method, host, duration and error kind. The path, query, headers and bodies are not logged.
+    static let slowSeconds: TimeInterval = 10
+    private func run(_ request: URLRequest, maximumBytes: Int, contentTypes: Set<String>, onChunk: @escaping @Sendable (Data) async throws -> Void,
                      task: @escaping @Sendable (URLSession) -> URLSessionDataTask) async throws {
         let id = UUID(), operation = HTTPStreamOperation(maximumBytes: maximumBytes, contentTypes: contentTypes)
         register(operation, id: id)
         defer { remove(id) }
+        let started = ProcessInfo.processInfo.systemUptime
+        let name = "\(request.httpMethod ?? "GET") \(request.url?.host ?? "unknown host")"
+        do {
+            try await perform(operation, onChunk: onChunk, task: task)
+            if ProcessInfo.processInfo.systemUptime - started > Self.slowSeconds { DiagnosticLog.shared.write("http", "\(name) answered after \(DiagnosticLog.elapsed(since: started))") }
+        } catch {
+            let cancelled: Bool
+            if case .cancelled? = error as? ProviderNetworkError { cancelled = true } else { cancelled = error is CancellationError }
+            if !cancelled {
+                let code = operation.urlErrorCode.map { " (URLError \($0))" } ?? ""
+                DiagnosticLog.shared.write("http", "\(name) failed after \(DiagnosticLog.elapsed(since: started)): \(error)\(code)")
+            }
+            throw error
+        }
+    }
+    private func perform(_ operation: HTTPStreamOperation, onChunk: @escaping @Sendable (Data) async throws -> Void,
+                         task: @escaping @Sendable (URLSession) -> URLSessionDataTask) async throws {
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
             operation.start(task(session), router: router)
@@ -244,8 +264,17 @@ private final class HTTPStreamOperation: @unchecked Sendable {
         watch = timer
         timer.resume()
     }
+    /// The URLError code of a failed request, for the diagnostic log.
+    var urlErrorCode: Int? { lock.withLock { failureCode } }
+    private var failureCode: Int?
+    /// A URLSession timeout is reported as a timeout, so the message does not point at the network.
     func completed(error: Error?) {
-        if error != nil { end(ProviderNetworkError.transport) } else { end() }
+        if let error = error as? URLError { lock.withLock { failureCode = error.code.rawValue } }
+        switch error {
+        case nil: end()
+        case let error as URLError where error.code == .timedOut: end(ProviderNetworkError.timedOut)
+        default: end(ProviderNetworkError.transport)
+        }
     }
     private func end(_ error: ProviderNetworkError? = nil) {
         lock.lock()

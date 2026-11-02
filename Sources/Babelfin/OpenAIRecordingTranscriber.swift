@@ -9,7 +9,8 @@ import BridgeCore
     private var operation: ProviderCancellation?
     nonisolated private static let responseBytes = 2 * 1_024 * 1_024
 
-    init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport()) { self.transport = transport }
+    /// The service answers after the whole file, so a long file needs the tool's 10 minutes.
+    init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport(requestTimeout: 600, resourceTimeout: 600)) { self.transport = transport }
 
     func transcribe(source: RecordingSource, sourceLanguage: String?, diarize: Bool,
                     credentials: ProviderCredentials) async throws -> RecordingTranscript {
@@ -88,7 +89,7 @@ import BridgeCore
         try token.check()
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/audio/transcriptions")!)
-        request.httpMethod = "POST"; request.httpBody = body; request.timeoutInterval = 90
+        request.httpMethod = "POST"; request.httpBody = body; request.timeoutInterval = 600
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         return request
     }

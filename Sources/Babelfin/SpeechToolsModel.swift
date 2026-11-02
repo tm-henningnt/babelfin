@@ -615,6 +615,8 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
         let token = UUID(); generation = token
         let credentialSnapshot = credentialVersion()
         operationCredentialVersion = credentialSnapshot
+        DiagnosticLog.shared.write("tools", "\(title) started")
+        let started = ProcessInfo.processInfo.systemUptime
         task = Task { [weak self] in
             guard let self else { return }
             let credentialLease = CredentialOperationActivity.shared.begin()
@@ -628,7 +630,13 @@ enum ClipVoiceService: String, CaseIterable, Identifiable, Sendable {
                 try await body(self, keys)
                 try Task.checkCancellation()
                 guard self.credentialVersion() == credentialSnapshot else { throw CancellationError() }
+                DiagnosticLog.shared.write("tools", "\(title) finished after \(DiagnosticLog.elapsed(since: started))")
             } catch {
+                let reason: String
+                if error is CancellationError || Task.isCancelled { reason = "cancelled" }
+                else if error is SpeechToolsUIError { reason = "failed: no key" }
+                else { reason = "failed: \(DiagnosticLog.kind(of: error))" }
+                DiagnosticLog.shared.write("tools", "\(title) \(reason) after \(DiagnosticLog.elapsed(since: started))")
                 guard self.generation == token else { return }
                 if error is CancellationError || Task.isCancelled { self.notice = "Cancelled."; self.isError = false }
                 else if let safe = error as? SpeechToolsError { self.showError(safe.localizedDescription) }

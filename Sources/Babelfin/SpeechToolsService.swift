@@ -32,19 +32,28 @@ extension SpeechToolsTranscriber {
     private var operation: ProviderCancellation?
     private var expired = false
 
-    init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport(),
+    /// Without a `transport`, Scribe gets its own transport with the long upload timeouts; the other
+    /// stages share one with the live timeouts. A given `transport` serves every stage.
+    init(transport: (any ProviderHTTPTransport)? = nil,
          transcriber: (any SpeechToolsTranscriber)? = nil, translator: (any TextTranslationStage)? = nil,
          elevenSynthesis: (any SpeechSynthesisStage)? = nil, fishSynthesis: (any SpeechSynthesisStage)? = nil,
          systemSynthesis: (any SpeechSynthesisStage)? = nil, geminiSynthesis: (any SpeechSynthesisStage)? = nil,
          operationTimeout: TimeInterval = 600) {
-        self.transport = transport
-        self.transcriber = transcriber ?? ElevenLabsRecordingTranscriber(transport: transport)
-        self.translator = translator ?? OpenAITextTranslationStage(transport: transport)
-        self.elevenSynthesis = elevenSynthesis ?? ElevenLabsSpeechSynthesisStage(transport: transport)
-        self.fishSynthesis = fishSynthesis ?? FishSpeechSynthesisStage(transport: transport)
+        let shared = transport ?? URLProviderHTTPTransport()
+        self.transport = shared
+        if let transcriber {
+            self.transcriber = transcriber
+        } else if let transport {
+            self.transcriber = ElevenLabsRecordingTranscriber(transport: transport)
+        } else {
+            self.transcriber = ElevenLabsRecordingTranscriber()
+        }
+        self.translator = translator ?? OpenAITextTranslationStage(transport: shared)
+        self.elevenSynthesis = elevenSynthesis ?? ElevenLabsSpeechSynthesisStage(transport: shared)
+        self.fishSynthesis = fishSynthesis ?? FishSpeechSynthesisStage(transport: shared)
         self.systemSynthesis = systemSynthesis ?? AppleSpeechSynthesisStage()
-        self.geminiSynthesis = geminiSynthesis ?? GeminiSpeechSynthesisStage(transport: transport)
-        self.voiceChanger = ElevenLabsVoiceChanger(transport: transport)
+        self.geminiSynthesis = geminiSynthesis ?? GeminiSpeechSynthesisStage(transport: shared)
+        self.voiceChanger = ElevenLabsVoiceChanger(transport: shared)
         self.operationTimeout = operationTimeout.isFinite ? min(3_600, max(0.01, operationTimeout)) : 600
     }
 
@@ -351,8 +360,13 @@ extension SpeechToolsTranscriber {
         } else if let audio {
             body.append(audio.bytes); body.append(trailer); request.httpBody = body
         }
-        // Scribe took 19.6 s for 20 minutes (trial 2026-11-01); a long meeting gets up to 30 minutes.
-        if case .meeting = source { request.timeoutInterval = 1_800 } else { request.timeoutInterval = 90 }
+        // Scribe answers after the whole file: 19.6 s for 20 minutes, 232 s for 74 minutes (trials 2026-11-01/02).
+        // A meeting gets up to 30 minutes, a chosen file the tool's 10 minutes, a short recording 90 s.
+        switch source {
+        case .meeting: request.timeoutInterval = 1_800
+        case .file: request.timeoutInterval = 600
+        case .memory: request.timeoutInterval = 90
+        }
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         return (request, bodyFile)
     }

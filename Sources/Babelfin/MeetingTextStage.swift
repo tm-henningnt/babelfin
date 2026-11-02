@@ -6,7 +6,8 @@ import BridgeCore
     static let model = "gpt-5.6-luna"
     private let transport: any ProviderHTTPTransport
     private var operation: ProviderCancellation?
-    init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport()) { self.transport = transport }
+    /// Notes for a long meeting send up to 200 000 characters; one answer took 37 s for 74 minutes (2026-11-02).
+    init(transport: any ProviderHTTPTransport = URLProviderHTTPTransport(requestTimeout: 300, resourceTimeout: 300)) { self.transport = transport }
     func complete(instructions: String, input: String, maximumOutput: Int, credentials: ProviderCredentials) async throws -> String {
         guard operation == nil else { throw ProviderNetworkError.busy }
         let token = ProviderCancellation(); operation = token; defer { operation = nil }

@@ -1057,6 +1057,7 @@ private final class CaptureAdmission: @unchecked Sendable {
         let time = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         logs.append("\(time)  \(detail)")
         if logs.count > 100 { logs.removeFirst(logs.count - 100) }
+        DiagnosticLog.shared.write(destination == .listen ? "listen" : "speak", detail)
     }
 }
 

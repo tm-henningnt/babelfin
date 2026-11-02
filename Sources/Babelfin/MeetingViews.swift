@@ -18,6 +18,8 @@ struct RecorderCard: View {
     @ObservedObject private var recorder = MeetingRecorder.shared
     @AppStorage(MeetingPreferences.kind) private var kind: MeetingRecordingKind = .online
     @AppStorage(MeetingPreferences.consentShown) private var consentShown = false
+    /// The spoken language for Scribe; empty lets Scribe detect it.
+    @AppStorage("babelfin.recorder.scribeLanguage") private var scribeLanguage = ""
     @StateObject private var state = RecorderCardState()
     var openTranscript: () -> Void
 
@@ -144,9 +146,16 @@ struct RecorderCard: View {
                     Button("Cancel") { meeting.cancel() }
                 }
             }
+            Picker("Spoken language", selection: $scribeLanguage) {
+                Text("Detect automatically").tag("")
+                ForEach(TranslationLanguage.elevenLabsOutputs) { Text($0.name).tag($0.code) }
+            }
+            .fixedSize()
+            .disabled(meeting.busy)
+            .help("For ElevenLabs Scribe. Choose the language when the whole meeting uses one; detection can pick a similar language.")
             HStack(spacing: 12) {
                 choice("person.wave.2", "ElevenLabs Scribe", "Speaker names, and finds which speaker is you. About $0.22 per hour of audio.") {
-                    meeting.transcribeWithScribe()
+                    meeting.transcribeWithScribe(language: scribeLanguage)
                 }
                 choice("lock.laptopcomputer", "On this Mac", "Nothing is sent and no key is needed. No speaker names; needs macOS 26.") {
                     meeting.transcribeOnThisMac(microphoneLanguage: microphoneLanguage, meetingLanguage: meetingLanguage)

@@ -122,12 +122,18 @@ struct MeetingDocument: Equatable {
 
     /// Views of this model change with the recorder's state, not with its level meters, which
     /// publish about 20 times a second; views that show levels observe the recorder itself.
-    init() { cancellation = recorder.$state.removeDuplicates().sink { [weak self] _ in self?.objectWillChange.send() } }
+    init() {
+        cancellation = recorder.$state.removeDuplicates().sink { [weak self] state in
+            DiagnosticLog.shared.write("recorder", "\(state)")
+            self?.objectWillChange.send()
+        }
+    }
 
     // MARK: Transcribe
 
     /// Sends the mixed recording to Scribe with speaker labels. The microphone track finds "You".
-    func transcribeWithScribe() {
+    /// `language` is the spoken language code, or empty to let Scribe detect it.
+    func transcribeWithScribe(language: String) {
         guard recorder.hasRecording else { return }
         let tracks = recorder.tracks, kind = recorder.kind, started = recorder.startedAt ?? Date()
         perform("Transcribing with ElevenLabs Scribe…", services: [.elevenLabs]) { model, keys in
@@ -135,7 +141,7 @@ struct MeetingDocument: Equatable {
             defer { try? FileManager.default.removeItem(at: upload) }
             let token = model.operation
             try await Task.detached { try MeetingAudioExport.m4a(tracks, to: upload, check: token.check) }.value
-            let transcript = try await model.tools.transcribe(source: .meeting(upload), sourceLanguage: nil, diarize: true, credentials: keys)
+            let transcript = try await model.tools.transcribe(source: .meeting(upload), sourceLanguage: language.isEmpty ? nil : language, diarize: true, credentials: keys)
             var local: String?
             if kind == .online, let microphone = tracks.first {
                 let activity = try await Task.detached { try MeetingAudioExport.activity(microphone) }.value
@@ -373,6 +379,8 @@ struct MeetingDocument: Equatable {
         guard !busy else { return }
         busy = true; activity = title; notice = ""; isError = false
         operation = ProviderCancellation()
+        DiagnosticLog.shared.write("meeting", "\(title) started")
+        let started = ProcessInfo.processInfo.systemUptime
         task = Task { [weak self] in
             guard let self else { return }
             let lease = CredentialOperationActivity.shared.begin()
@@ -390,7 +398,10 @@ struct MeetingDocument: Equatable {
                     throw BridgeError.unavailable("Add your \(names) API key in Settings › Accounts, or allow Keychain access, then try again.")
                 }
                 try await body(self, keys)
+                DiagnosticLog.shared.write("meeting", "\(title) finished after \(DiagnosticLog.elapsed(since: started))")
             } catch {
+                let reason = error is CancellationError || Task.isCancelled ? "cancelled" : "failed: \(DiagnosticLog.kind(of: error))"
+                DiagnosticLog.shared.write("meeting", "\(title) \(reason) after \(DiagnosticLog.elapsed(since: started))")
                 if error is CancellationError || Task.isCancelled { self.notice = "Cancelled."; self.isError = false }
                 else if let safe = error as? SpeechToolsError { self.showError(safe.localizedDescription) }
                 else if let safe = error as? BridgeError { self.showError(safe.localizedDescription) }

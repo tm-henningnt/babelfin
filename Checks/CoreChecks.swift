@@ -41,6 +41,25 @@ final class DelayedDeviceScheduler: AudioBufferScheduling {
 @main struct CoreChecks {
     static func main() async throws {
         let checks: [(String, () throws -> Void)] = [
+            ("Diagnostic log: one line per call, owner-only file, rotation", {
+                let folder = FileManager.default.temporaryDirectory.appendingPathComponent("diagnostic-log-\(UUID().uuidString)")
+                defer { try? FileManager.default.removeItem(at: folder) }
+                let log = DiagnosticLog(folder: folder, maximumBytes: 200)
+                log.write("meeting", "Transcribing\nwith Scribe started"); log.flush()
+                let first = try String(contentsOf: log.fileURL, encoding: .utf8)
+                try expect(first.hasSuffix("  meeting  Transcribing with Scribe started\n") && first.split(separator: "\n").count == 1, "One line, line break replaced: \(first)")
+                let mode = try FileManager.default.attributesOfItem(atPath: log.fileURL.path)[.posixPermissions] as? Int
+                try expect(mode == 0o600, "The log file is readable only by the user: \(String(mode ?? 0, radix: 8))")
+                for index in 0..<6 { log.write("http", "POST api.example failed after 1.0 s: timedOut \(index)") }
+                log.flush()
+                let previous = folder.appendingPathComponent("Babelfin.1.log")
+                let current = try String(contentsOf: log.fileURL, encoding: .utf8)
+                try expect(FileManager.default.fileExists(atPath: previous.path), "A full log moves to Babelfin.1.log")
+                try expect(current.utf8.count <= 200 && current.contains("timedOut 5"), "The new file keeps the newest lines within the limit")
+                try expect(DiagnosticLog(folder: folder, enabled: false).fileURL == log.fileURL, "Same file name when disabled")
+                try expect(DiagnosticLog.kind(of: SpeechToolsError.recordingTooLarge) == "recordingTooLarge", "Tool errors log their case")
+                try expect(DiagnosticLog.kind(of: CocoaError(.fileNoSuchFile)) == "NSError", "Other errors log only their type")
+            }),
             ("Meeting recording: mix, activity, local speaker and prompts", {
                 func pcm(_ values: [Int16]) -> Data { values.withUnsafeBufferPointer { Data(buffer: $0) } }
                 let mixed = MeetingAudio.mix(pcm([1_000, 30_000, -30_000]), pcm([2_000, 10_000]))

@@ -135,6 +135,17 @@ struct GlossarySettingsView: View {
 
 /// Settings › Advanced: connection checks, session details, your own server and the Azure endpoint.
 struct AdvancedSettingsView: View {
+    /// Selects the log file in Finder, or opens its folder before the first line is written.
+    static func showLogFile() {
+        let log = DiagnosticLog.shared
+        log.flush()
+        if FileManager.default.fileExists(atPath: log.fileURL.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([log.fileURL])
+        } else {
+            try? FileManager.default.createDirectory(at: DiagnosticLog.folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            NSWorkspace.shared.open(DiagnosticLog.folder)
+        }
+    }
     @ObservedObject var conversation: ConversationModel
     @ObservedObject private var activity = CredentialOperationActivity.shared
     private var model: AppModel { conversation.selected }
@@ -165,11 +176,13 @@ struct AdvancedSettingsView: View {
                             .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }.frame(height: 160)
-                    HStack {
-                        Text("Audio, API keys and transcripts are excluded.").font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Clear") { model.clearDiagnostics() }.accessibilityLabel("Clear diagnostic details")
-                    }
+                }
+                HStack {
+                    Text("Babelfin also writes these details, failed requests and meeting steps to a log file in your user Library › Logs › Babelfin. Audio, API keys and transcripts are excluded.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("Show Log File") { Self.showLogFile() }
+                    if !model.logs.isEmpty { Button("Clear") { model.clearDiagnostics() }.accessibilityLabel("Clear diagnostic details") }
                 }
             } header: { Text("Session details for support") }
             TranslationServerSection(editsAllowed: editsAllowed)
